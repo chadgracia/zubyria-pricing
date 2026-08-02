@@ -6,21 +6,20 @@ GET  /quote.json  -> JSON quote (same params) — for future Telegram bot / AI c
 import json
 from datetime import date
 from urllib.parse import parse_qs
-from pricing_engine import quote, PROPERTIES, Quote
+from pricing_engine import quote, load_rules, Quote
 
-HOUSES = list(PROPERTIES.keys())
-
-def parse_params(qs: dict):
+def parse_params(qs: dict, props: dict):
     p = {k: v for k, v in (qs or {}).items()}
     checkin = date.fromisoformat(p["checkin"])
     checkout = date.fromisoformat(p["checkout"])
     bookings = {}
-    for h in HOUSES:
+    for h in props:
         if p.get(f"h_{h}") == "on":
-            bookings[h] = int(p.get(f"g_{h}", PROPERTIES[h]["base_cap"]))
+            bookings[h] = int(p.get(f"g_{h}", props[h]["base_cap"]))
     jacuzzi = int(p.get("jacuzzi", 0) or 0)
+    pets = int(p.get("pets", 0) or 0)
     btype = p.get("btype", "cash")
-    return checkin, checkout, bookings, jacuzzi, btype
+    return checkin, checkout, bookings, jacuzzi, pets, btype
 
 def quote_to_dict(q: Quote):
     return {
@@ -31,6 +30,7 @@ def quote_to_dict(q: Quote):
         "airbnb_fee": q.airbnb_fee, "cc_fee": q.cc_fee,
         "gross_profit": q.gross_profit, "anya_bonus": q.anya_bonus,
         "min_stay_required": q.min_stay_required,
+        "rules_source": q.rules_source,
     }
 
 CSS = """
@@ -63,14 +63,14 @@ color:var(--dim);font-weight:normal;margin:0 0 12px}
 .bonus{color:var(--ok)}
 """
 
-def render_page(params=None, q: Quote = None, error=None):
+def render_page(props: dict, params=None, q: Quote = None, error=None):
     v = params or {}
     def val(k, d=""): return v.get(k, d)
     def chk(k): return "checked" if v.get(k) == "on" else ""
     def sel(k, opt, d=None): return "selected" if v.get(k, d) == opt else ""
     house_rows = ""
-    for h in HOUSES:
-        p = PROPERTIES[h]
+    for h in props:
+        p = props[h]
         opts = "".join(f'<option {"selected" if str(g)==val("g_"+h, str(p["base_cap"])) else ""}>{g}</option>'
                        for g in range(1, p["max_guests"] + 1))
         house_rows += f'''<div class="house"><input type="checkbox" name="h_{h}" id="h_{h}" {chk("h_"+h)}>
@@ -89,7 +89,8 @@ def render_page(params=None, q: Quote = None, error=None):
             body = (f'<div class="line">{lines}</div>'
                     f'<div class="tot">Guest pays: <b>${q.subtotal:,.2f}</b>{abnb}{fee}'
                     f'<br>Gross profit: ${q.gross_profit:,.2f} &nbsp;·&nbsp; '
-                    f'<span class="bonus">Anya\'s bonus (20%): ${q.anya_bonus:,.2f}</span></div>')
+                    f'<span class="bonus">Anya\'s bonus (20%): ${q.anya_bonus:,.2f}</span></div>'
+                    f'<div style="color:var(--dim);font-size:11px;margin-top:8px;font-family:Verdana">rules: {q.rules_source}</div>')
         result_html = f'<div class="result"><h2>Quote &amp; reasoning</h2>{body}</div>'
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -107,6 +108,7 @@ def render_page(params=None, q: Quote = None, error=None):
 <fieldset><legend>Houses &amp; guests</legend><div class="row">{house_rows}</div></fieldset>
 <fieldset><legend>Extras &amp; channel</legend><div class="row">
 <label>Jacuzzi uses <input type="number" name="jacuzzi" min="0" value="{val('jacuzzi','0')}"></label>
+<label>Pets <input type="number" name="pets" min="0" value="{val('pets','0')}"></label>
 <label>Booking type <select name="btype">
 <option value="cash" {sel('btype','cash','cash')}>Cash (0%)</option>
 <option value="airbnb" {sel('btype','airbnb')}>Airbnb (15.5%)</option>
@@ -125,22 +127,23 @@ flatpickr('#checkin', {{dateFormat:'Y-m-d', minDate:'today',
 def lambda_handler(event, context):
     path = event.get("rawPath", "/")
     qs = event.get("queryStringParameters") or {}
+    props = load_rules()["properties"]
     wants_json = path.rstrip("/").endswith("quote.json")
     if not qs.get("checkin"):
         if wants_json:
-            return _resp(400, {"error": "checkin, checkout required; h_<house>=on, g_<house>, jacuzzi, btype"}, json_=True)
-        return _resp(200, render_page())
+            return _resp(400, {"error": "checkin, checkout required; h_<house>=on, g_<house>, jacuzzi, pets, btype"}, json_=True)
+        return _resp(200, render_page(props))
     try:
-        checkin, checkout, bookings, jacuzzi, btype = parse_params(qs)
+        checkin, checkout, bookings, jacuzzi, pets, btype = parse_params(qs, props)
         if not bookings:
             raise ValueError("Select at least one house")
-        q = quote(checkin, checkout, bookings, jacuzzi_uses=jacuzzi, booking_type=btype)
+        q = quote(checkin, checkout, bookings, jacuzzi_uses=jacuzzi, pets=pets, booking_type=btype)
     except (ValueError, KeyError) as e:
         if wants_json: return _resp(400, {"error": str(e)}, json_=True)
-        return _resp(200, render_page(qs, error=f"Check your inputs: {e}"))
+        return _resp(200, render_page(props, qs, error=f"Check your inputs: {e}"))
     if wants_json:
         return _resp(200, quote_to_dict(q), json_=True)
-    return _resp(200, render_page(qs, q=q))
+    return _resp(200, render_page(props, qs, q=q))
 
 def _resp(status, body, json_=False):
     return {"statusCode": status,
