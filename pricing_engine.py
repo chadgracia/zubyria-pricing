@@ -8,12 +8,12 @@ Rules encoded per Chad's decisions of 2026-08-02:
   - Jacuzzi $100 PER USE, only with Zharyna.
   - Cleaning $100 once per stay per house. Guest pays it; excluded from gross profit.
   - Min stay: holiday row MinStay if any night is in that range, else default 2.
+  - Max stay: Tseglina 7, Zharyna 7, Modryna 10 nights.
   - Airbnb: 15.5% COMMISSION on the listed subtotal (fee deducted from payout).
     Listing price to net X = X / (1 - 0.155).
-  - Payment fees: cash 0%, monobank 1.3%, stripe 5.5% (estimate). Applied to
-    direct bookings only; Airbnb processes its own payments.
+  - Booking types: airbnb 15.5% commission / cash 0% / monobank 1.3% / stripe ~5.5%.
   - Anya's bonus: 20% of gross profit =
-    (nightly + extra guests + jacuzzi) - airbnb fee - cc fee.
+    (nightly + extra guests + jacuzzi) - channel/processing fees.
 """
 
 from datetime import date, timedelta
@@ -22,9 +22,9 @@ from dataclasses import dataclass, field
 # ---------- Rules (mirrors the sheet; later: parsed from sheet export) ----------
 
 PROPERTIES = {
-    "tseglina": dict(name="Tseglina", weekday=100, weekend=200, base_cap=5, extra_fee=25, max_guests=6, cleaning=100),
-    "modryna":  dict(name="Modryna",  weekday=150, weekend=225, base_cap=4, extra_fee=25, max_guests=7, cleaning=100),
-    "zharyna":  dict(name="Zharyna",  weekday=100, weekend=200, base_cap=5, extra_fee=25, max_guests=6, cleaning=100),
+    "tseglina": dict(name="Tseglina", weekday=100, weekend=200, base_cap=5, extra_fee=25, max_guests=6, cleaning=100, max_stay=7),
+    "modryna":  dict(name="Modryna",  weekday=150, weekend=225, base_cap=4, extra_fee=25, max_guests=7, cleaning=100, max_stay=10),
+    "zharyna":  dict(name="Zharyna",  weekday=100, weekend=200, base_cap=5, extra_fee=25, max_guests=6, cleaning=100, max_stay=7),
 }
 
 HOLIDAYS = [  # (start, end, label, multiplier, min_stay)
@@ -48,8 +48,12 @@ HOLIDAYS = [  # (start, end, label, multiplier, min_stay)
 
 JACUZZI_FEE = 100          # per use, requires zharyna
 DEFAULT_MIN_STAY = 2
-AIRBNB_FEE_PCT = 0.155     # commission on listed subtotal
-PAYMENT_FEES = {"cash": 0.0, "monobank": 0.013, "stripe": 0.055}
+BOOKING_TYPES = {  # fee pct, and whether it is an airbnb-style commission on the listed price
+    "airbnb":   dict(fee=0.155, commission=True,  label="Airbnb (15.5% commission)"),
+    "cash":     dict(fee=0.0,   commission=False, label="Cash"),
+    "monobank": dict(fee=0.013, commission=False, label="Website — Monobank (1.3%)"),
+    "stripe":   dict(fee=0.055, commission=False, label="Website — Stripe (~5.5%)"),
+}
 BONUS_PCT = 0.20
 
 # ---------- Engine ----------
@@ -97,12 +101,13 @@ class Quote:
     errors: list = field(default_factory=list)
 
 def quote(check_in: date, check_out: date, bookings: dict, jacuzzi_uses: int = 0,
-          channel: str = "direct", payment: str = "cash") -> Quote:
+          booking_type: str = "cash") -> Quote:
     """
     bookings: {property_id: guest_count}
-    channel: 'direct' | 'airbnb'
-    payment: 'cash' | 'monobank' | 'stripe'  (ignored for airbnb)
+    booking_type: 'airbnb' | 'cash' | 'monobank' | 'stripe'
     """
+    if booking_type not in BOOKING_TYPES:
+        q = Quote(); q.errors.append(f"Unknown booking type: {booking_type}"); return q
     q = Quote()
     nights = (check_out - check_in).days
     if nights <= 0:
@@ -113,6 +118,8 @@ def quote(check_in: date, check_out: date, bookings: dict, jacuzzi_uses: int = 0
         p = PROPERTIES[pid]
         if guests > p["max_guests"]:
             q.errors.append(f"{p['name']}: {guests} guests exceeds max {p['max_guests']}")
+        if nights > p["max_stay"]:
+            q.errors.append(f"{p['name']}: {nights} nights exceeds maximum stay of {p['max_stay']}")
     if q.errors: return q
 
     # min stay: strictest holiday touched by any night
@@ -147,16 +154,16 @@ def quote(check_in: date, check_out: date, bookings: dict, jacuzzi_uses: int = 0
     q.rental_price = nightly_total + extra_total + jacuzzi_total
     q.subtotal = q.rental_price + q.cleaning_total
 
-    if channel == "airbnb":
-        q.airbnb_listing_price = round(q.subtotal / (1 - AIRBNB_FEE_PCT), 2)
-        q.airbnb_fee = round(q.subtotal * AIRBNB_FEE_PCT, 2)  # fee if listed at direct price (no gross-up)
-        q.lines.append(f"Airbnb: list at ${q.airbnb_listing_price:,.2f} to net ${q.subtotal:,.2f} (15.5% commission)")
+    bt = BOOKING_TYPES[booking_type]
+    if bt["commission"]:
+        q.airbnb_listing_price = round(q.subtotal / (1 - bt["fee"]), 2)
+        q.airbnb_fee = round(q.subtotal * bt["fee"], 2)
+        q.lines.append(f"{bt['label']}: list at ${q.airbnb_listing_price:,.2f} to net ${q.subtotal:,.2f}")
         q.gross_profit = q.rental_price - q.airbnb_fee
     else:
-        pct = PAYMENT_FEES[payment]
-        q.cc_fee = round(q.subtotal * pct, 2)
+        q.cc_fee = round(q.subtotal * bt["fee"], 2)
         if q.cc_fee:
-            q.lines.append(f"Payment ({payment}): processing fee {pct:.1%} = ${q.cc_fee:,.2f}")
+            q.lines.append(f"{bt['label']}: processing fee ${q.cc_fee:,.2f}")
         q.gross_profit = q.rental_price - q.cc_fee
 
     q.anya_bonus = round(q.gross_profit * BONUS_PCT, 2)

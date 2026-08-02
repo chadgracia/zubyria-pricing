@@ -19,9 +19,8 @@ def parse_params(qs: dict):
         if p.get(f"h_{h}") == "on":
             bookings[h] = int(p.get(f"g_{h}", PROPERTIES[h]["base_cap"]))
     jacuzzi = int(p.get("jacuzzi", 0) or 0)
-    channel = p.get("channel", "direct")
-    payment = p.get("payment", "cash")
-    return checkin, checkout, bookings, jacuzzi, channel, payment
+    btype = p.get("btype", "cash")
+    return checkin, checkout, bookings, jacuzzi, btype
 
 def quote_to_dict(q: Quote):
     return {
@@ -46,7 +45,7 @@ form{background:var(--panel);border:1px solid #333c36;border-radius:6px;padding:
 fieldset{border:0;padding:0;margin:0 0 16px}
 legend{font-family:Verdana,sans-serif;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--dim);margin-bottom:8px}
 label{display:inline-block;margin-right:18px;font-size:15px}
-input[type=date],select,input[type=number]{background:var(--bg);color:var(--ink);border:1px solid #3d4741;
+input[type=text],select,input[type=number]{background:var(--bg);color:var(--ink);border:1px solid #3d4741;
 border-radius:4px;padding:7px 9px;font:14px Verdana,sans-serif}
 input[type=number]{width:70px}
 .row{display:flex;flex-wrap:wrap;gap:14px;align-items:center}
@@ -94,27 +93,34 @@ def render_page(params=None, q: Quote = None, error=None):
         result_html = f'<div class="result"><h2>Quote &amp; reasoning</h2>{body}</div>'
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Zubyria — pricing</title><style>{CSS}</style></head><body><div class="wrap">
+<title>Zubyria — pricing</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/flatpickr/4.6.13/flatpickr.min.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/flatpickr/4.6.13/themes/dark.min.css">
+<style>{CSS}</style></head><body><div class="wrap">
 <h1>Zubyria <b>pricing</b></h1>
 <div class="sub">Three houses · banya · jacuzzi — internal quote tool</div>
 <form method="get" action="/">
 <fieldset><legend>Dates</legend><div class="row">
-<label>Check-in <input type="date" name="checkin" value="{val('checkin')}" required></label>
-<label>Check-out <input type="date" name="checkout" value="{val('checkout')}" required></label>
+<label>Check-in <input type="text" id="checkin" name="checkin" placeholder="select date" value="{val('checkin')}" required></label>
+<label>Check-out <input type="text" id="checkout" name="checkout" placeholder="select date" value="{val('checkout')}" required></label>
 </div></fieldset>
 <fieldset><legend>Houses &amp; guests</legend><div class="row">{house_rows}</div></fieldset>
 <fieldset><legend>Extras &amp; channel</legend><div class="row">
 <label>Jacuzzi uses <input type="number" name="jacuzzi" min="0" value="{val('jacuzzi','0')}"></label>
-<label>Channel <select name="channel">
-<option value="direct" {sel('channel','direct','direct')}>Direct</option>
-<option value="airbnb" {sel('channel','airbnb')}>Airbnb</option></select></label>
-<label>Payment <select name="payment">
-<option value="cash" {sel('payment','cash','cash')}>Cash (0%)</option>
-<option value="monobank" {sel('payment','monobank')}>Monobank (1.3%)</option>
-<option value="stripe" {sel('payment','stripe')}>Stripe (~5.5%)</option></select></label>
+<label>Booking type <select name="btype">
+<option value="cash" {sel('btype','cash','cash')}>Cash (0%)</option>
+<option value="airbnb" {sel('btype','airbnb')}>Airbnb (15.5%)</option>
+<option value="monobank" {sel('btype','monobank')}>Website — Monobank (1.3%)</option>
+<option value="stripe" {sel('btype','stripe')}>Website — Stripe (~5.5%)</option></select></label>
 </div></fieldset>
 <button type="submit">Calculate price</button>
-</form>{result_html}</div></body></html>"""
+</form>{result_html}</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/flatpickr/4.6.13/flatpickr.min.js"></script>
+<script>
+var co = flatpickr('#checkout', {{dateFormat:'Y-m-d', minDate:'today'}});
+flatpickr('#checkin', {{dateFormat:'Y-m-d', minDate:'today',
+  onChange: function(sel){{ if(sel[0]){{ var d=new Date(sel[0]); d.setDate(d.getDate()+1); co.set('minDate', d); }} }} }});
+</script></body></html>"""
 
 def lambda_handler(event, context):
     path = event.get("rawPath", "/")
@@ -122,13 +128,13 @@ def lambda_handler(event, context):
     wants_json = path.rstrip("/").endswith("quote.json")
     if not qs.get("checkin"):
         if wants_json:
-            return _resp(400, {"error": "checkin, checkout required; h_<house>=on, g_<house>, jacuzzi, channel, payment"}, json_=True)
+            return _resp(400, {"error": "checkin, checkout required; h_<house>=on, g_<house>, jacuzzi, btype"}, json_=True)
         return _resp(200, render_page())
     try:
-        checkin, checkout, bookings, jacuzzi, channel, payment = parse_params(qs)
+        checkin, checkout, bookings, jacuzzi, btype = parse_params(qs)
         if not bookings:
             raise ValueError("Select at least one house")
-        q = quote(checkin, checkout, bookings, jacuzzi_uses=jacuzzi, channel=channel, payment=payment)
+        q = quote(checkin, checkout, bookings, jacuzzi_uses=jacuzzi, booking_type=btype)
     except (ValueError, KeyError) as e:
         if wants_json: return _resp(400, {"error": str(e)}, json_=True)
         return _resp(200, render_page(qs, error=f"Check your inputs: {e}"))
