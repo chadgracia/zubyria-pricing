@@ -31,6 +31,106 @@ def _d(s):
     return date.fromisoformat(s)
 
 
+def _recompute_from_subtotal(subtotal, cleaning_total, btype):
+    """Derive fees / profit / bonus for a given guest-pays total.
+
+    Mirrors pricing_engine.quote()'s model exactly, with the computed subtotal
+    swapped for whatever total is passed in. Cleaning is a fixed cost and is never
+    discounted, so it comes off the top before the fee is applied to profit.
+    """
+    from pricing_engine import BOOKING_TYPES, BONUS_PCT
+    bt = BOOKING_TYPES.get(btype) or BOOKING_TYPES["cash"]
+    rental = round(subtotal - cleaning_total, 2)
+    fee = round(subtotal * bt["fee"], 2)
+    listing = round(subtotal / (1 - bt["fee"]), 2) if bt["commission"] else None
+    gross = round(rental - fee, 2)
+    return {
+        "rental_price_effective": rental,
+        "fee": fee,
+        "listing_price": listing,
+        "gross_profit": gross,
+        "bonus": round(gross * BONUS_PCT, 2),
+    }
+
+
+def _apply_override(snap, btype, override_subtotal):
+    """Return a snapshot whose live fields reflect a manual price.
+
+    The originally computed figures are preserved as computed_*, so a revert is
+    lossless and the details view can show both. Everything downstream (BONUS tab,
+    Remaining, chart marker) keeps reading subtotal/gross_profit/bonus and therefore
+    sees the effective numbers with no special-casing.
+    """
+    out = dict(snap)
+    out.setdefault("computed_subtotal", snap.get("subtotal", 0))
+    out.setdefault("computed_gross_profit", snap.get("gross_profit", 0))
+    out.setdefault("computed_bonus", snap.get("bonus", 0))
+    r = _recompute_from_subtotal(override_subtotal,
+                                 float(snap.get("cleaning_total", 0) or 0), btype)
+    out["override_subtotal"] = override_subtotal
+    out["subtotal"] = override_subtotal
+    out["gross_profit"] = r["gross_profit"]
+    out["bonus"] = r["bonus"]
+    out["fee"] = r["fee"]
+    out["rental_price_effective"] = r["rental_price_effective"]
+    if r["listing_price"] is not None:
+        out["listing_price"] = r["listing_price"]
+    return out
+
+
+def _revert_override(snap):
+    """Restore the computed figures and drop every override-only field."""
+    out = dict(snap)
+    if "computed_subtotal" not in out:
+        return out
+    out["subtotal"] = out.pop("computed_subtotal")
+    out["gross_profit"] = out.pop("computed_gross_profit", out.get("gross_profit", 0))
+    out["bonus"] = out.pop("computed_bonus", out.get("bonus", 0))
+    for k in ("override_subtotal", "fee", "rental_price_effective", "listing_price"):
+        out.pop(k, None)
+    return out
+
+
+def _price_override_form(b, snap, subtotal, is_custom, kp):
+    """Collapsed 'Edit price' panel for the details view (admin-only, like its caller).
+
+    Uses <details> so it needs no JS, and a GET form matching every other admin action.
+    """
+    key_hidden = ""
+    if kp:
+        key_hidden = f'<input type="hidden" name="key" value="{html_esc(kp[5:])}">'
+    cleaning = float(snap.get("cleaning_total", 0) or 0)
+    note_val = html_esc((b.get("price_note") or "").strip())
+    revert = ""
+    if is_custom:
+        revert_url = (f"/admin?tab=block&action=revert_price"
+                      f"&block_id={urllib.parse.quote(b['sk'], safe='')}{kp}")
+        revert = (f'<a href="{html_esc(revert_url)}" class="btn-sec" '
+                  f'style="margin-left:8px">Revert to calculated</a>')
+    hint = (f'Cleaning (${cleaning:,.2f}) is a fixed cost and is never discounted.'
+            if cleaning else 'Fees and bonus are recalculated from this price.')
+    return (
+        f'<details style="margin-top:10px">'
+        f'<summary style="cursor:pointer;color:var(--dim);font:12px Verdana">'
+        f'Edit price</summary>'
+        f'<form method="get" action="/admin" style="margin-top:8px">'
+        f'<input type="hidden" name="tab" value="block">'
+        f'<input type="hidden" name="action" value="set_price">'
+        f'<input type="hidden" name="block_id" value="{html_esc(b["sk"])}">'
+        f'{key_hidden}'
+        f'<div class="row" style="align-items:flex-end">'
+        f'<label>Final price ($) <input type="number" name="price" min="0" step="0.01" '
+        f'value="{subtotal:.2f}" style="width:110px"></label>'
+        f'<label>Reason <input type="text" name="price_note" value="{note_val}" '
+        f'placeholder="e.g. friend discount" style="min-width:200px"></label>'
+        f'</div>'
+        f'<p style="color:var(--dim);font-size:11px;font-family:Verdana;margin:6px 0 8px">'
+        f'{html_esc(hint)}</p>'
+        f'<button type="submit">Save price</button>{revert}'
+        f'</form></details>'
+    )
+
+
 def _payment_state(b):
     """Deposit / remaining for a block. Computed at render time, never stored.
 
@@ -562,7 +662,7 @@ def render_page(props: dict, params=None, q: Quote = None, error=None,
 def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
                  tab="block", q=None, price_error=None, price_params=None,
                  avail=None, block_url=None, month_str="", detail_block=None,
-                 confirm_cancel=False):
+                 confirm_cancel=False, price_warning=""):
     pf = prefill or {}
     kp = f"&key={admin_key}" if admin_key else ""
     key_hidden = f'<input type="hidden" name="key" value="{html_esc(admin_key)}">' if admin_key else ""
@@ -630,6 +730,11 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
                 hs = ", ".join(props.get(h, {}).get("name", h) for h in b.get("houses", []))
                 snap = b["snapshot"]
                 b_dep, b_rem, b_over, _ = _payment_state(b)
+                custom_tag = ""
+                if snap.get("override_subtotal") is not None:
+                    custom_tag = ('<span style="color:var(--dim);font-size:10px;'
+                                  'text-transform:uppercase;letter-spacing:.08em">'
+                                  ' custom</span>')
                 if b_over:
                     paid_cell = (f'${b_dep:,.2f} / <span style="color:var(--err)">'
                                  f'overpaid</span>')
@@ -643,7 +748,7 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
                     f'<td style="padding:8px 12px;border-bottom:1px solid #2a322d">{html_esc(b.get("checkin",""))} → {html_esc(b.get("checkout",""))}</td>'
                     f'<td style="padding:8px 12px;border-bottom:1px solid #2a322d">{html_esc(hs)}</td>'
                     f'<td style="padding:8px 12px;border-bottom:1px solid #2a322d">{html_esc(b.get("btype","—"))}</td>'
-                    f'<td style="padding:8px 12px;border-bottom:1px solid #2a322d">${snap.get("subtotal",0):,.2f}</td>'
+                    f'<td style="padding:8px 12px;border-bottom:1px solid #2a322d">${snap.get("subtotal",0):,.2f}{custom_tag}</td>'
                     f'<td style="padding:8px 12px;border-bottom:1px solid #2a322d">{paid_cell}</td>'
                     f'<td class="bonus" style="padding:8px 12px;border-bottom:1px solid #2a322d">${snap.get("bonus",0):,.2f}</td>'
                     f'</tr>'
@@ -740,6 +845,11 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
                 edit_parts.append(f"notes={urllib.parse.quote(b['notes'], safe='')}")
             if b.get("deposit"):
                 edit_parts.append(f"deposit={b['deposit']}")
+            if b.get("override_subtotal"):
+                edit_parts.append(f"override_subtotal={b['override_subtotal']}")
+                if b.get("price_note"):
+                    edit_parts.append(
+                        f"price_note={urllib.parse.quote(b['price_note'], safe='')}")
             if b.get("btype"):
                 edit_parts.append(f"btype={urllib.parse.quote(b['btype'], safe='')}")
                 qp = b.get("quote_params") or {}
@@ -794,15 +904,42 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
                 if fee_amount:
                     fee_label = "Airbnb commission" if bt_info.get("commission") else "Processing fee"
                     fee_html = f'<br>{html_esc(fee_label)}: ${fee_amount:,.2f}'
+
+                # Manual override: show the custom price with the calculated one
+                # struck through beside it, so both numbers stay visible.
+                is_custom = snap.get("override_subtotal") is not None
+                if is_custom:
+                    note_txt = (b.get("price_note") or "").strip()
+                    note_html = (f' (custom — {html_esc(note_txt)})' if note_txt
+                                 else " (custom)")
+                    price_line = (
+                        f'Final price: <b>${subtotal:,.2f}</b>'
+                        f'<span style="color:var(--dim);font-size:12px">{note_html}</span>'
+                        f'&nbsp;<span style="color:var(--dim);text-decoration:line-through">'
+                        f'${snap.get("computed_subtotal", 0):,.2f}</span>'
+                    )
+                else:
+                    price_line = f'Guest pays: <b>${subtotal:,.2f}</b>'
+
+                # Airbnb: the listed number must be grossed up so the net matches.
+                listing_html = ""
+                if bt_info.get("commission"):
+                    lp = snap.get("listing_price")
+                    if lp is None and fee_rate < 1:
+                        lp = round(subtotal / (1 - fee_rate), 2)
+                    if lp:
+                        listing_html = f'<br>List at: ${lp:,.2f}'
+
                 finance_html = (
                     f'<div class="tot" style="border-top:0;margin-top:8px;padding-top:0">'
                     f'<span style="color:var(--dim);font-size:11px;font-family:Verdana">'
                     f'{html_esc(bt_label)}</span><br>'
-                    f'Guest pays: <b>${subtotal:,.2f}</b>{fee_html}'
+                    f'{price_line}{listing_html}{fee_html}'
                     f'{pay_html}'
                     f'<br>Gross profit: ${gross_profit:,.2f} &nbsp;·&nbsp; '
                     f'<span class="bonus">Anya\'s bonus (20%): ${bonus:,.2f}</span>'
                     f'</div>'
+                    f'{_price_override_form(b, snap, subtotal, is_custom, kp)}'
                 )
                 # Quote params summary
                 qp = b.get("quote_params") or {}
@@ -974,13 +1111,18 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
             f'{html_esc(pf.get("notes",""))}</textarea></label>'
         )
 
-        if msg:
+        if msg or price_warning:
             ok = msg.lower().startswith("block") and "conflict" not in msg.lower()
             msg_color = "var(--ok)" if ok else "var(--err)"
-            msg_html = (
-                f'<div class="result"><p style="margin:0;color:{msg_color}">'
-                f'{html_esc(msg)}</p></div>'
-            )
+            msg_line = (f'<p style="margin:0;color:{msg_color}">{html_esc(msg)}</p>'
+                        if msg else "")
+            warn_line = ""
+            if price_warning:
+                warn_line = (
+                    f'<p style="margin:6px 0 0;color:var(--accent);font-size:12px">'
+                    f'{html_esc(price_warning)}</p>'
+                )
+            msg_html = f'<div class="result">{msg_line}{warn_line}</div>'
         else:
             msg_html = ""
 
@@ -1091,6 +1233,7 @@ def _lambda_handler(event, context):
         action = qs.get("action", "")
         month_str = qs.get("month", "")
         msg = ""
+        price_warning = ""
         prefill = dict(qs)
 
         # Block actions (only relevant in block tab)
@@ -1137,6 +1280,10 @@ def _lambda_handler(event, context):
                                 "subtotal": snap_q.subtotal,
                                 "gross_profit": snap_q.gross_profit,
                                 "bonus": snap_q.anya_bonus,
+                                # kept so a manual override can re-derive fees:
+                                # cleaning is a fixed cost and is never discounted
+                                "cleaning_total": snap_q.cleaning_total,
+                                "rental_price": snap_q.rental_price,
                             }
                             quote_params_out = {
                                 "houses": snap_bookings,
@@ -1148,6 +1295,30 @@ def _lambda_handler(event, context):
                             }
                     except Exception:
                         pass
+
+                # An existing manual price survives a date/param edit: the amount is
+                # kept verbatim and its fees/bonus are re-derived against the new
+                # snapshot. Whether it still applies is a human call, hence the warning.
+                try:
+                    ov_in = float(qs.get("override_subtotal", "") or 0)
+                except ValueError:
+                    ov_in = 0.0
+                price_note = qs.get("price_note", "").strip()
+                if ov_in and snapshot:
+                    cleaning = float(snapshot.get("cleaning_total", 0) or 0)
+                    if ov_in >= cleaning:
+                        snapshot = _apply_override(snapshot, snap_btype, ov_in)
+                        price_warning = (
+                            f"Custom price ${ov_in:,.2f} kept from before this change — "
+                            f"re-check that it still applies to the new dates/params."
+                        )
+                    else:
+                        ov_in = 0.0
+                        price_warning = (
+                            "Custom price dropped: it was below the cleaning cost "
+                            "for the new dates."
+                        )
+
                 r = _get_store().add_block(
                     houses, ci, co, label,
                     created_by=f"edited from {edit_id}" if edit_id else "admin",
@@ -1157,6 +1328,8 @@ def _lambda_handler(event, context):
                     btype=snap_btype or None,
                     notes=notes or None,
                     deposit=deposit or None,
+                    override_subtotal=ov_in or None,
+                    price_note=price_note or None,
                 )
                 if r["ok"]:
                     if edit_id:
@@ -1171,6 +1344,45 @@ def _lambda_handler(event, context):
             except ValueError as e:
                 msg = f"Error: {e}"
             tab = "block"
+
+        elif action in ("set_price", "revert_price"):
+            block_id = qs.get("block_id", "")
+            target = None
+            for b in _get_store().list_blocks():
+                if b.get("sk") == block_id and b.get("status") == "active":
+                    target = b
+                    break
+            if not target:
+                msg = "Error: block not found."
+            elif not target.get("snapshot"):
+                msg = "Error: this block has no price to override."
+            elif action == "revert_price":
+                _get_store().set_price_override(
+                    block_id, _revert_override(target["snapshot"]), None, None)
+                msg = "Price reverted to calculated."
+            else:
+                snap = target["snapshot"]
+                cleaning = float(snap.get("cleaning_total", 0) or 0)
+                try:
+                    new_price = float(qs.get("price", "") or 0)
+                except ValueError:
+                    new_price = -1.0
+                if new_price < 0:
+                    msg = "Error: enter a valid price."
+                elif new_price < cleaning:
+                    msg = (f"Error: price must be at least the cleaning cost "
+                           f"(${cleaning:,.2f}).")
+                else:
+                    _get_store().set_price_override(
+                        block_id,
+                        _apply_override(snap, target.get("btype", "cash"), new_price),
+                        new_price,
+                        qs.get("price_note", "").strip(),
+                    )
+                    msg = f"Price set to ${new_price:,.2f}."
+            tab = "block"
+            if not qs.get("details"):
+                qs = dict(qs, details=block_id)
 
         elif action == "cancel_block":
             block_id = qs.get("block_id", "")
@@ -1245,7 +1457,7 @@ def _lambda_handler(event, context):
             tab=tab, q=q_price, price_error=price_error, price_params=dict(qs),
             avail=price_avail, block_url=price_block_url,
             month_str=month_str, detail_block=detail_block,
-            confirm_cancel=confirm_cancel,
+            confirm_cancel=confirm_cancel, price_warning=price_warning,
         ))
         if via_key:
             resp["cookies"] = [_admin_cookie()]

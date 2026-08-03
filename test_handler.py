@@ -39,7 +39,7 @@ class FakeStore:
 
     def add_block(self, houses, checkin, checkout, label, created_by="admin",
                   exclude_id=None, snapshot=None, quote_params=None, btype=None,
-                  notes=None, deposit=None):
+                  notes=None, deposit=None, override_subtotal=None, price_note=None):
         ci_d = checkin if isinstance(checkin, date) else date.fromisoformat(str(checkin))
         co_d = checkout if isinstance(checkout, date) else date.fromisoformat(str(checkout))
         conflicts = []
@@ -78,8 +78,23 @@ class FakeStore:
             item["notes"] = notes
         if deposit:
             item["deposit"] = deposit
+        if override_subtotal:
+            item["override_subtotal"] = override_subtotal
+        if price_note:
+            item["price_note"] = price_note
         self._blocks.append(item)
         return {"ok": True}
+
+    def set_price_override(self, block_id, snapshot, override_subtotal, price_note):
+        for b in self._blocks:
+            if b.get("sk") == block_id:
+                b["snapshot"] = snapshot
+                if override_subtotal is None:
+                    b.pop("override_subtotal", None)
+                    b.pop("price_note", None)
+                else:
+                    b["override_subtotal"] = override_subtotal
+                    b["price_note"] = price_note or ""
 
     def cancel_block(self, block_id):
         for b in self._blocks:
@@ -589,10 +604,24 @@ class StrictDynamoTable:
         self._check_no_floats(Item)
         self._items.append(dict(Item))
 
-    def update_item(self, Key, UpdateExpression, ExpressionAttributeNames, ExpressionAttributeValues):
+    def update_item(self, Key, UpdateExpression, ExpressionAttributeNames,
+                    ExpressionAttributeValues=None):
+        self._check_no_floats(ExpressionAttributeValues or {})
+        vals = ExpressionAttributeValues or {}
+        set_part, _, remove_part = UpdateExpression.partition("REMOVE")
+        set_part = set_part.replace("SET", "", 1)
         for item in self._items:
-            if item.get("pk") == Key["pk"] and item.get("sk") == Key["sk"]:
-                item["status"] = ExpressionAttributeValues[":s"]
+            if item.get("pk") != Key["pk"] or item.get("sk") != Key["sk"]:
+                continue
+            for assign in set_part.split(","):
+                if "=" not in assign:
+                    continue
+                lhs, rhs = (x.strip() for x in assign.split("=", 1))
+                item[ExpressionAttributeNames.get(lhs, lhs)] = vals[rhs]
+            for nm in remove_part.split(","):
+                nm = nm.strip()
+                if nm:
+                    item.pop(ExpressionAttributeNames.get(nm, nm), None)
 
     def query(self, KeyConditionExpression, ExpressionAttributeValues, **kw):
         pk_val = ExpressionAttributeValues[":pk"]
@@ -1058,6 +1087,206 @@ r_nd10 = lambda_function.lambda_handler(ev("/admin", {"tab": "block", "details":
 t("AT_nd10: non-admin sees no deposit", "Downpayment" not in r_nd10["body"])
 t("AT_nd10: non-admin sees no notes section", ">Notes</h3>" not in r_nd10["body"])
 t("AT_nd10: non-admin denied", "Access denied" in r_nd10["body"])
+
+# ── AT_ov: manual price override ─────────────────────────────────────────────
+
+print("\n=== Price override tests ===")
+
+# Airbnb block: computed subtotal 3600, cleaning 200 → override to 3000
+def _ov_block(**kw):
+    b = {
+        "pk": "blocks", "sk": "block#ov", "houses": ["tseglina"],
+        "checkin": "2026-09-10", "checkout": "2026-09-13",
+        "label": "Override Guest", "created_by": "admin", "status": "active",
+        "btype": "airbnb",
+        "snapshot": {
+            "subtotal": 3600.0, "gross_profit": 2842.0, "bonus": 568.40,
+            "cleaning_total": 200.0, "rental_price": 3400.0,
+        },
+    }
+    b.update(kw)
+    return b
+
+def _set_price(store, price, note="friend discount", block_id="block#ov"):
+    lambda_function._store = store
+    return lambda_function.lambda_handler(ev("/admin", {
+        "key": ADMIN_SECRET, "tab": "block", "action": "set_price",
+        "block_id": block_id, "price": str(price), "price_note": note,
+    }), None)
+
+# AT_ov1 – the recompute itself matches the specified arithmetic
+_calc = lambda_function._recompute_from_subtotal(3000.0, 200.0, "airbnb")
+t("AT_ov1: airbnb fee on override is 465", _calc["fee"] == 465.0)
+t("AT_ov1: rental effective is override minus cleaning",
+  _calc["rental_price_effective"] == 2800.0)
+t("AT_ov1: gross profit is 2335", _calc["gross_profit"] == 2335.0)
+t("AT_ov1: bonus is 467.00", _calc["bonus"] == 467.0)
+t("AT_ov1: airbnb listing price is 3550.30", _calc["listing_price"] == 3550.30)
+_calc_card = lambda_function._recompute_from_subtotal(3000.0, 200.0, "stripe")
+t("AT_ov1: card fee is a pct of the override", _calc_card["fee"] == round(3000 * 0.055, 2))
+t("AT_ov1: card type has no listing price", _calc_card["listing_price"] is None)
+
+# AT_ov2 – saving an override stores computed_* and recomputed live fields
+_store_ov2 = FakeStore([_ov_block()])
+_set_price(_store_ov2, 3000)
+_snap_ov2 = _store_ov2._blocks[0]["snapshot"]
+t("AT_ov2: override amount stored", _snap_ov2["override_subtotal"] == 3000.0)
+t("AT_ov2: live subtotal is the override", _snap_ov2["subtotal"] == 3000.0)
+t("AT_ov2: original subtotal preserved", _snap_ov2["computed_subtotal"] == 3600.0)
+t("AT_ov2: original bonus preserved", _snap_ov2["computed_bonus"] == 568.40)
+t("AT_ov2: gross profit recomputed to 2335", _snap_ov2["gross_profit"] == 2335.0)
+t("AT_ov2: bonus recomputed to 467.00", _snap_ov2["bonus"] == 467.0)
+t("AT_ov2: listing price recomputed to 3550.30", _snap_ov2["listing_price"] == 3550.30)
+t("AT_ov2: reason stored as price_note",
+  _store_ov2._blocks[0]["price_note"] == "friend discount")
+t("AT_ov2: cleaning untouched by the discount", _snap_ov2["cleaning_total"] == 200.0)
+
+# AT_ov3 – details view shows both prices and the recomputed figures
+body_ov3 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "details": "block#ov"}), None)["body"]
+t("AT_ov3: final price shown", "Final price: <b>$3,000.00</b>" in body_ov3)
+t("AT_ov3: custom marker with the reason", "(custom — friend discount)" in body_ov3)
+t("AT_ov3: original price struck through",
+  "line-through" in body_ov3 and "$3,600.00" in body_ov3)
+t("AT_ov3: recomputed commission shown", "Airbnb commission: $465.00" in body_ov3)
+t("AT_ov3: recomputed gross profit shown", "Gross profit: $2,335.00" in body_ov3)
+t("AT_ov3: recomputed bonus shown", "$467.00" in body_ov3)
+t("AT_ov3: airbnb listing price shown", "List at: $3,550.30" in body_ov3)
+t("AT_ov3: edit price control present", ">Edit price</summary>" in body_ov3)
+t("AT_ov3: revert control present", "Revert to calculated" in body_ov3)
+
+# AT_ov4 – revert restores the computed numbers and drops override-only fields
+lambda_function._store = _store_ov2
+r_ov4 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "action": "revert_price",
+    "block_id": "block#ov"}), None)
+_snap_ov4 = _store_ov2._blocks[0]["snapshot"]
+t("AT_ov4: revert reports success", "reverted" in r_ov4["body"].lower())
+t("AT_ov4: subtotal back to computed", _snap_ov4["subtotal"] == 3600.0)
+t("AT_ov4: override field removed", "override_subtotal" not in _snap_ov4)
+t("AT_ov4: computed_* fields removed", "computed_subtotal" not in _snap_ov4)
+t("AT_ov4: price_note cleared from item",
+  "price_note" not in _store_ov2._blocks[0])
+t("AT_ov4: details no longer shows a custom marker",
+  "(custom" not in lambda_function.lambda_handler(ev("/admin", {
+      "key": ADMIN_SECRET, "tab": "block", "details": "block#ov"}), None)["body"])
+
+# AT_ov5 – an override below the cleaning cost is rejected, nothing is written
+_store_ov5 = FakeStore([_ov_block()])
+r_ov5 = _set_price(_store_ov5, 150)
+t("AT_ov5: sub-cleaning override rejected", "at least the cleaning cost" in r_ov5["body"])
+t("AT_ov5: rejection names the cleaning figure", "$200.00" in r_ov5["body"])
+t("AT_ov5: snapshot untouched after rejection",
+  _store_ov5._blocks[0]["snapshot"]["subtotal"] == 3600.0)
+t("AT_ov5: no override written after rejection",
+  "override_subtotal" not in _store_ov5._blocks[0]["snapshot"])
+# exactly at the cleaning cost is allowed
+_store_ov5b = FakeStore([_ov_block()])
+_set_price(_store_ov5b, 200)
+t("AT_ov5: override equal to cleaning is accepted",
+  _store_ov5b._blocks[0]["snapshot"]["override_subtotal"] == 200.0)
+
+# AT_ov6 – BONUS tab uses the effective bonus and marks the row custom
+_store_ov6 = FakeStore([_ov_block()])
+_set_price(_store_ov6, 3000)
+lambda_function._store = _store_ov6
+body_ov6 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "bonus", "month": "2026-09"}), None)["body"]
+t("AT_ov6: BONUS row shows the overridden price", "$3,000.00" in body_ov6)
+t("AT_ov6: BONUS row carries a custom marker", "custom</span>" in body_ov6)
+t("AT_ov6: BONUS total uses the overridden bonus",
+  _re.search(r"Total bonus</td>.*?\$467\.00", body_ov6, _re.S) is not None)
+t("AT_ov6: original bonus not used in the total", "$568.40" not in body_ov6)
+
+# AT_ov7 – Remaining is measured against the override, not the computed price
+_store_ov7 = FakeStore([_ov_block(deposit=500.0)])
+_set_price(_store_ov7, 3000)
+lambda_function._store = _store_ov7
+body_ov7 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "details": "block#ov"}), None)["body"]
+t("AT_ov7: remaining uses the override (3000-500)", "Remaining: $2,500.00" in body_ov7)
+t("AT_ov7: remaining does not use the computed price", "Remaining: $3,100.00" not in body_ov7)
+
+# AT_ov8 – editing dates keeps the override amount, re-derives it, and warns
+_store_ov8 = FakeStore([_ov_block()])
+_set_price(_store_ov8, 3000)
+lambda_function._store = _store_ov8
+r_ov8 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "action": "add_block",
+    "edit_id": "block#ov",
+    "dates": "2026-09-20 to 2026-09-24",          # different dates
+    "h_tseglina": "on", "label": "Override Guest",
+    "btype": "airbnb", "g_tseglina": "4",
+    "override_subtotal": "3000.0", "price_note": "friend discount",
+}), None)
+t("AT_ov8: edit succeeds", "Block updated" in r_ov8["body"])
+t("AT_ov8: warning shown that the custom price predates the change",
+  "kept from before this change" in r_ov8["body"])
+_new_ov8 = [b for b in _store_ov8._blocks
+            if b.get("status") == "active" and b.get("checkin") == "2026-09-20"][0]
+t("AT_ov8: override amount preserved verbatim",
+  _new_ov8["snapshot"]["override_subtotal"] == 3000.0)
+t("AT_ov8: live subtotal still the override", _new_ov8["snapshot"]["subtotal"] == 3000.0)
+t("AT_ov8: price_note carried across the edit",
+  _new_ov8.get("price_note") == "friend discount")
+t("AT_ov8: computed_* reflect the NEW dates, not the old snapshot",
+  _new_ov8["snapshot"]["computed_subtotal"] != 3600.0)
+t("AT_ov8: bonus re-derived from the override and new cleaning",
+  _new_ov8["snapshot"]["bonus"] == lambda_function._recompute_from_subtotal(
+      3000.0, _new_ov8["snapshot"]["cleaning_total"], "airbnb")["bonus"])
+
+# AT_ov9 – a block with no snapshot cannot be overridden
+_store_ov9 = FakeStore([{
+    "pk": "blocks", "sk": "block#ov9", "houses": ["tseglina"],
+    "checkin": "2026-09-10", "checkout": "2026-09-13", "label": "Unpriced",
+    "created_by": "admin", "status": "active",
+}])
+r_ov9 = _set_price(_store_ov9, 1000, block_id="block#ov9")
+t("AT_ov9: override refused without a price snapshot",
+  "no price to override" in r_ov9["body"])
+t("AT_ov9: unpriced block has no edit-price form",
+  ">Edit price</summary>" not in lambda_function.lambda_handler(ev("/admin", {
+      "key": ADMIN_SECRET, "tab": "block", "details": "block#ov9"}), None)["body"])
+
+# AT_ov10 – override survives a float-rejecting table, and non-admin sees none of it
+_strict_ov = StrictDynamoTable()
+_store_ov10 = Store(_strict_ov)
+_store_ov10.add_block(
+    houses=["tseglina"], checkin=date(2026, 11, 1), checkout=date(2026, 11, 4),
+    label="Strict override", btype="airbnb",
+    snapshot={"subtotal": 3600.0, "gross_profit": 2842.0, "bonus": 568.40,
+              "cleaning_total": 200.0, "rental_price": 3400.0},
+)
+_sk_ov10 = _store_ov10.list_blocks()[0]["sk"]
+_store_ov10.set_price_override(
+    _sk_ov10,
+    lambda_function._apply_override(
+        _store_ov10.list_blocks()[0]["snapshot"], "airbnb", 3000.0),
+    3000.0, "friend discount")
+_read_ov10 = _store_ov10.list_blocks()[0]
+t("AT_ov10: override written through a float-rejecting table",
+  _read_ov10["snapshot"]["override_subtotal"] == 3000.0)
+t("AT_ov10: recomputed bonus survives the round-trip",
+  _read_ov10["snapshot"]["bonus"] == 467.0)
+t("AT_ov10: no Decimal leaks back out",
+  not isinstance(_read_ov10["snapshot"]["bonus"], Decimal))
+t("AT_ov10: price_note round-trips", _read_ov10["price_note"] == "friend discount")
+_store_ov10.set_price_override(
+    _sk_ov10, lambda_function._revert_override(_read_ov10["snapshot"]), None, None)
+_rev_ov10 = _store_ov10.list_blocks()[0]
+t("AT_ov10: REMOVE clears the override on revert",
+  "override_subtotal" not in _rev_ov10 and _rev_ov10["snapshot"]["subtotal"] == 3600.0)
+
+lambda_function._store = _store_ov7
+r_ov10n = lambda_function.lambda_handler(ev("/admin", {
+    "tab": "block", "details": "block#ov"}), None)
+t("AT_ov10: non-admin sees no price override UI",
+  "Edit price" not in r_ov10n["body"] and "Access denied" in r_ov10n["body"])
+r_ov10s = lambda_function.lambda_handler(ev("/admin", {
+    "tab": "block", "action": "set_price", "block_id": "block#ov", "price": "1"}), None)
+t("AT_ov10: non-admin cannot set a price",
+  "Access denied" in r_ov10s["body"]
+  and _store_ov7._blocks[0]["snapshot"]["subtotal"] == 3000.0)
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 print()

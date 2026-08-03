@@ -86,7 +86,7 @@ class Store:
 
     def add_block(self, houses, checkin, checkout, label, created_by="admin",
                   exclude_id=None, snapshot=None, quote_params=None, btype=None,
-                  notes=None, deposit=None):
+                  notes=None, deposit=None, override_subtotal=None, price_note=None):
         """Check availability for the given houses (excluding exclude_id block); if any conflict,
         return {"ok": False, "conflicts": [label, ...]} without writing.
         On success write the item and return {"ok": True, "id": sk}."""
@@ -120,8 +120,38 @@ class Store:
         if deposit:
             # _to_dynamo turns the float into a Decimal at the store boundary.
             item["deposit"] = deposit
+        if override_subtotal:
+            item["override_subtotal"] = override_subtotal
+        if price_note:
+            item["price_note"] = price_note
         self._t.put_item(Item=_to_dynamo(item))
         return {"ok": True, "id": sk}
+
+    def set_price_override(self, block_id, snapshot, override_subtotal, price_note):
+        """Write a manual price override, or clear it when override_subtotal is None.
+
+        Only the price fields move; dates, houses and notes are untouched, so the
+        block keeps its identity (and its detail URL) across a re-price.
+        """
+        names = {"#sn": "snapshot", "#ov": "override_subtotal", "#pn": "price_note"}
+        if override_subtotal is None:
+            self._t.update_item(
+                Key={"pk": "BLOCK", "sk": block_id},
+                UpdateExpression="SET #sn = :sn REMOVE #ov, #pn",
+                ExpressionAttributeNames=names,
+                ExpressionAttributeValues={":sn": _to_dynamo(snapshot)},
+            )
+        else:
+            self._t.update_item(
+                Key={"pk": "BLOCK", "sk": block_id},
+                UpdateExpression="SET #sn = :sn, #ov = :ov, #pn = :pn",
+                ExpressionAttributeNames=names,
+                ExpressionAttributeValues=_to_dynamo({
+                    ":sn": snapshot,
+                    ":ov": override_subtotal,
+                    ":pn": price_note or "",
+                }),
+            )
 
     def cancel_block(self, block_id):
         self._t.update_item(
