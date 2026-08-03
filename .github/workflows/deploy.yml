@@ -15,5 +15,5 @@ jobs:
           role-to-assume: arn:aws:iam::271378210266:role/github-actions-deploy
           aws-region: us-east-1
       - run: |
-          zip -j function.zip lambda_function.py pricing_engine.py
+          zip -j function.zip *.py
           aws lambda update-function-code --function-name zubyria-pricing --zip-file fileb://function.zip
