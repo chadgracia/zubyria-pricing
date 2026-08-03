@@ -146,6 +146,10 @@ text-overflow:ellipsis;line-height:1}
 text-overflow:ellipsis;font:10px/22px Verdana,sans-serif;color:#fff;padding:0 4px;
 text-decoration:none}
 .tape-bar:hover{filter:brightness(1.15)}
+.tape-seg-wrap{display:flex;height:22px;align-items:stretch}
+.tape-seg{overflow:hidden;height:22px}
+.tape-seg-l,.tape-seg-r{width:50%;flex-shrink:0}
+.tape-seg-full{width:100%;display:block}
 """
 
 # Flatpickr range script with live availability greying (not an f-string to avoid brace escaping)
@@ -355,7 +359,9 @@ def _render_tape_chart(props, blocks, win_start, win_end, today_date, rules,
             f'{hm}</th>'
         )
 
-    # Filter active blocks intersecting window
+    # Filter active blocks intersecting window.
+    # Include bo == win_start so checkout-day left-half bars render at window edge.
+    # Checkout 10:00 / checkin 16:00
     active = []
     for b in blocks:
         if b.get("status") != "active":
@@ -364,28 +370,50 @@ def _render_tape_chart(props, blocks, win_start, win_end, today_date, rules,
             bc, bo = _d(b["checkin"]), _d(b["checkout"])
         except (KeyError, ValueError):
             continue
-        if bo > win_start and bc <= win_end:
+        if bo >= win_start and bc <= win_end:
             active.append(b)
 
-    # House rows
+    # House rows — per-cell rendering with half-day slots.
+    # right_slot[d] = block checking IN on day d  → right half of cell
+    # left_slot[d]  = block checking OUT on day d → left half of cell
+    # full_slot[d]  = block occupying all of day d (neither checkin nor checkout)
     rows_html = ""
     for house_id, hp in props.items():
-        day_block = {}
+        right_slot = {}  # checkin day → block
+        left_slot = {}   # checkout day → block
+        full_slot = {}   # full day → block
+
         for b in active:
             if house_id not in b.get("houses", []):
                 continue
             bc, bo = _d(b["checkin"]), _d(b["checkout"])
-            cur = max(bc, win_start)
-            last = min(bo - timedelta(days=1), win_end)
-            while cur <= last:
-                day_block[cur] = b
+
+            clipped_start = bc < win_start  # block started before visible window
+            clipped_end = bo > win_end      # block ends after visible window
+
+            # Checkin half: right-half of checkin cell (or full if clipped at start)
+            if clipped_start:
+                # Flat left edge — mark win_start as full rather than right-half
+                if win_start not in left_slot:
+                    full_slot[win_start] = b
+            elif win_start <= bc <= win_end:
+                right_slot[bc] = b
+
+            # Full days between checkin and checkout (exclusive)
+            full_first = win_start if clipped_start else bc + timedelta(days=1)
+            full_last = win_end if clipped_end else bo - timedelta(days=1)
+            cur = full_first
+            while cur <= full_last and cur <= win_end:
+                if cur not in right_slot and cur not in left_slot:
+                    full_slot[cur] = b
                 cur += timedelta(days=1)
 
+            # Checkout half: left-half of checkout cell (or omit if clipped at end)
+            if not clipped_end and win_start <= bo <= win_end:
+                left_slot[bo] = b
+
         cells = ""
-        pos = 0
-        while pos < n_days:
-            d = window_days[pos]
-            b = day_block.get(d)
+        for d in window_days:
             cls = "tape-dc"
             if d.weekday() >= 5:
                 cls += " tape-we"
@@ -394,34 +422,47 @@ def _render_tape_chart(props, blocks, win_start, win_end, today_date, rules,
             if holiday_for(d, rules):
                 cls += " tape-hl"
 
-            if b:
-                span = 1
-                while (pos + span < n_days
-                       and day_block.get(window_days[pos + span]) is b):
-                    span += 1
+            l_blk = left_slot.get(d)
+            r_blk = right_slot.get(d)
+            f_blk = full_slot.get(d)
+
+            def _bar(b, seg_cls):
                 color = _block_color(b["sk"])
                 label = b.get("label", "?")
                 detail_url = f"/admin?tab=block&details={html_esc(b['sk'])}{kp}"
-                data = (
+                return (
+                    f'<a class="tape-bar tape-seg {seg_cls}"'
+                    f' href="{detail_url}"'
+                    f' style="background:{color}"'
+                    f' title="{html_esc(label)}"'
                     f' data-house="{html_esc(house_id)}"'
                     f' data-checkin="{html_esc(b["checkin"])}"'
-                    f' data-checkout="{html_esc(b["checkout"])}"'
+                    f' data-checkout="{html_esc(b["checkout"])}">'
+                    f'{html_esc(label)}</a>'
                 )
-                cells += (
-                    f'<td class="{cls}" colspan="{span}"{data}>'
-                    f'<a class="tape-bar" href="{detail_url}" '
-                    f'style="background:{color}" title="{html_esc(label)}">'
-                    f'{html_esc(label)}</a></td>'
-                )
-                pos += span
+
+            if l_blk and r_blk:
+                # Same-day turnover: checkout left-half + checkin right-half
+                inner = _bar(l_blk, "tape-seg-l") + _bar(r_blk, "tape-seg-r")
+                cells += f'<td class="{cls}"><div class="tape-seg-wrap">{inner}</div></td>'
+            elif l_blk:
+                cells += f'<td class="{cls}"><div class="tape-seg-wrap">{_bar(l_blk, "tape-seg-l")}</div></td>'
+            elif r_blk:
+                cells += f'<td class="{cls}"><div class="tape-seg-wrap">{_bar(r_blk, "tape-seg-r")}</div></td>'
+            elif f_blk:
+                cells += f'<td class="{cls}">{_bar(f_blk, "tape-seg-full")}</td>'
             else:
                 cells += f'<td class="{cls}"></td>'
-                pos += 1
 
         rows_html += (
             f'<tr><td class="tape-lc">{html_esc(hp["name"])}</td>{cells}</tr>'
         )
 
+    legend = (
+        '<p style="color:var(--dim);font-size:11px;margin:4px 0 16px">'
+        'bar starts mid-day&nbsp;=&nbsp;check-in 4pm&nbsp;&nbsp;·&nbsp;&nbsp;'
+        'ends mid-day&nbsp;=&nbsp;check-out 10am</p>'
+    )
     return (
         f'<div class="tape-wrap">'
         f'<table class="tape-tbl">'
@@ -429,6 +470,7 @@ def _render_tape_chart(props, blocks, win_start, win_end, today_date, rules,
         f'<tbody>{rows_html}</tbody>'
         f'</table>'
         f'</div>'
+        f'{legend}'
     )
 
 

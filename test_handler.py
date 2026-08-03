@@ -202,7 +202,8 @@ r = lambda_function.lambda_handler(ev("/admin", {"key": ADMIN_SECRET, "tab": "bl
 body = r["body"]
 t("T2: data-checkin present", 'data-checkin="2026-09-10"' in body)
 t("T2: data-checkout present", 'data-checkout="2026-09-13"' in body)
-t("T2: bar spans exactly 3 days (colspan=3)", 'colspan="3"' in body)
+t("T2: checkin shows right-half segment", 'tape-seg-r' in body)
+t("T2: checkout day shows left-half segment", 'tape-seg-l' in body)
 t("T2: checkout day not in block bar data", 'data-checkin="2026-09-13"' not in body)
 
 # Tape 3 – Back-to-back blocks both render without overlap
@@ -640,6 +641,92 @@ t("AT_D4: json route unhandled exception → 500", r_d4["statusCode"] == 500)
 import json as _json
 _body_d4 = _json.loads(r_d4["body"])
 t("AT_D4: 500 JSON has 'error' key", "error" in _body_d4)
+
+# ── AT_hd: Half-day tape chart bars ──────────────────────────────────────────
+
+print("\n=== Half-day tape chart bar tests ===")
+
+# AT_hd1 – checkin=right-half, checkout=left-half, middle days=full
+_store_hd1 = FakeStore([{
+    "pk": "blocks", "sk": "block#hd1",
+    "houses": ["tseglina"],
+    "checkin": "2026-08-10", "checkout": "2026-08-15",
+    "label": "Half-day Block", "created_by": "admin", "status": "active",
+}])
+lambda_function._store = _store_hd1
+r_hd1 = lambda_function.lambda_handler(
+    ev("/admin", {"key": ADMIN_SECRET, "tab": "block", "month": "2026-08"}), None)
+body_hd1 = r_hd1["body"]
+t("AT_hd1: checkin day has right-half segment", 'tape-seg-r"' in body_hd1)
+t("AT_hd1: checkout day has left-half segment", 'tape-seg-l"' in body_hd1)
+t("AT_hd1: middle days have full segment", 'tape-seg-full"' in body_hd1)
+t("AT_hd1: data-checkin present on bar", 'data-checkin="2026-08-10"' in body_hd1)
+t("AT_hd1: data-checkout present on bar", 'data-checkout="2026-08-15"' in body_hd1)
+t("AT_hd1: legend text present", "check-in 4pm" in body_hd1)
+
+# AT_hd2 – same-day turnover: block A checkout and block B checkin on same day
+_store_hd2 = FakeStore([
+    {
+        "pk": "blocks", "sk": "block#hd2a",
+        "houses": ["tseglina"],
+        "checkin": "2026-08-10", "checkout": "2026-08-15",
+        "label": "Guest A", "created_by": "admin", "status": "active",
+    },
+    {
+        "pk": "blocks", "sk": "block#hd2b",
+        "houses": ["tseglina"],
+        "checkin": "2026-08-15", "checkout": "2026-08-18",
+        "label": "Guest B", "created_by": "admin", "status": "active",
+    },
+])
+lambda_function._store = _store_hd2
+r_hd2 = lambda_function.lambda_handler(
+    ev("/admin", {"key": ADMIN_SECRET, "tab": "block", "month": "2026-08"}), None)
+body_hd2 = r_hd2["body"]
+t("AT_hd2: turnover day has wrap div (both halves)", 'class="tape-seg-wrap"' in body_hd2)
+t("AT_hd2: block A checkout visible on turnover day", 'data-checkout="2026-08-15"' in body_hd2)
+t("AT_hd2: block B checkin visible on turnover day", 'data-checkin="2026-08-15"' in body_hd2)
+# Conflict check: same house, overlapping dates → Conflict
+lambda_function._store = _store_hd2
+r_hd2_conflict = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "action": "add_block",
+    "dates": "2026-08-12 to 2026-08-16",
+    "h_tseglina": "on", "label": "Conflict test",
+}), None)
+t("AT_hd2: conflict detection still works", "Conflict" in r_hd2_conflict["body"])
+
+# AT_hd3 – clipped left edge: block started before window → no right-half at window start
+# Using trailing-quote suffix (tape-seg-r") to match HTML elements only, not CSS rule text
+_store_hd3 = FakeStore([{
+    "pk": "blocks", "sk": "block#hd3",
+    "houses": ["tseglina"],
+    "checkin": "2026-07-25", "checkout": "2026-08-05",
+    "label": "Clipped Start", "created_by": "admin", "status": "active",
+}])
+lambda_function._store = _store_hd3
+r_hd3 = lambda_function.lambda_handler(
+    ev("/admin", {"key": ADMIN_SECRET, "tab": "block", "month": "2026-08"}), None)
+body_hd3 = r_hd3["body"]
+t("AT_hd3: clipped-start has no right-half at window edge", 'tape-seg-r"' not in body_hd3)
+t("AT_hd3: clipped-start has full bar at window start", 'tape-seg-full"' in body_hd3)
+t("AT_hd3: clipped-start has left-half for checkout day", 'tape-seg-l"' in body_hd3)
+
+# AT_hd4 – clipped right edge: block ends after window → no left-half beyond window
+# Window for month=2026-08 spans Aug 1 – Sep 30; use checkout=2026-10-05 to clip right edge
+# Using trailing-quote suffix to match HTML elements only, not CSS rule text
+_store_hd4 = FakeStore([{
+    "pk": "blocks", "sk": "block#hd4",
+    "houses": ["tseglina"],
+    "checkin": "2026-09-25", "checkout": "2026-10-05",
+    "label": "Clipped End", "created_by": "admin", "status": "active",
+}])
+lambda_function._store = _store_hd4
+r_hd4 = lambda_function.lambda_handler(
+    ev("/admin", {"key": ADMIN_SECRET, "tab": "block", "month": "2026-08"}), None)
+body_hd4 = r_hd4["body"]
+t("AT_hd4: clipped-end has right-half for checkin day", 'tape-seg-r"' in body_hd4)
+t("AT_hd4: clipped-end has no left-half (checkout beyond window)", 'tape-seg-l"' not in body_hd4)
+t("AT_hd4: clipped-end has full segment for middle days", 'tape-seg-full"' in body_hd4)
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 print()
