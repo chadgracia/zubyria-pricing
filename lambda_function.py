@@ -341,10 +341,9 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
 
         house_checks = ""
         for h, p in props.items():
-            checked = "checked" if pf.get(f"h_{h}") == "on" else ""
             house_checks += (
                 f'<label style="margin-right:16px">'
-                f'<input type="checkbox" name="h_{h}" {checked}> {html_esc(p["name"])}'
+                f'<input type="checkbox" name="h_{h}"> {html_esc(p["name"])}'
                 f'</label>'
             )
 
