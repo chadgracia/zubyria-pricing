@@ -18,6 +18,10 @@ _store = None
 
 _BLOCK_COLORS = ["#4e7a5b", "#4a6080", "#7a5a4a", "#6a4f80", "#3d7070"]
 
+# Tape-chart day column width in px. Must match .tape-dc in CSS — bar geometry is
+# computed off it, so the two cannot drift apart.
+_TAPE_CELL_W = 34
+
 
 def _d(s):
     return date.fromisoformat(s)
@@ -134,7 +138,7 @@ font:12px Verdana,sans-serif;color:var(--ink);padding:4px 6px;white-space:nowrap
 overflow:hidden;text-overflow:ellipsis}
 .tape-dh{min-width:34px;width:34px;text-align:center;font:10px Verdana,sans-serif;
 color:var(--dim);padding:2px 0}
-.tape-dc{min-width:34px;width:34px;height:28px;padding:1px}
+.tape-dc{min-width:34px;width:34px;max-width:34px;height:28px;padding:1px;position:relative}
 .tape-we{background:#1a2320}
 .tape-today{outline:2px solid var(--accent);outline-offset:-1px}
 .tape-hl{background:#252515}
@@ -142,14 +146,19 @@ color:var(--dim);padding:2px 0}
 .tape-dw{font-size:9px;color:var(--dim);line-height:1}
 .tape-hm{font-size:7px;color:var(--accent);white-space:nowrap;overflow:hidden;
 text-overflow:ellipsis;line-height:1}
-.tape-bar{display:block;height:22px;border-radius:2px;overflow:hidden;white-space:nowrap;
-text-overflow:ellipsis;font:10px/22px Verdana,sans-serif;color:#fff;padding:0 4px;
-text-decoration:none}
+/* Bars are absolutely positioned so their label can never widen a day column.
+   Geometry: left:50% of the check-in cell → width = nights * 34px, landing on the
+   midpoint of the check-out cell. Diagonal edges via clip-path (checkout 10:00,
+   check-in 16:00); the 7px lean makes a departing and an arriving bar meet in the
+   same cell with a clean parallel gap instead of touching. */
+.tape-bar{position:absolute;top:3px;height:22px;border-radius:2px;overflow:hidden;
+white-space:nowrap;text-overflow:ellipsis;font:10px/22px Verdana,sans-serif;color:#fff;
+padding:0 9px;text-decoration:none;box-sizing:border-box;z-index:0}
 .tape-bar:hover{filter:brightness(1.15)}
-.tape-seg-wrap{display:flex;height:22px;align-items:stretch}
-.tape-seg{overflow:hidden;height:22px}
-.tape-seg-l,.tape-seg-r{width:50%;flex-shrink:0}
-.tape-seg-full{width:100%;display:block}
+.tape-slant-both{clip-path:polygon(7px 0,100% 0,calc(100% - 7px) 100%,0 100%)}
+.tape-slant-start{clip-path:polygon(7px 0,100% 0,100% 100%,0 100%)}
+.tape-slant-end{clip-path:polygon(0 0,100% 0,calc(100% - 7px) 100%,0 100%)}
+.tape-bar-nolabel{font-size:0;padding:0}
 """
 
 # Flatpickr range script with live availability greying (not an f-string to avoid brace escaping)
@@ -373,44 +382,70 @@ def _render_tape_chart(props, blocks, win_start, win_end, today_date, rules,
         if bo >= win_start and bc <= win_end:
             active.append(b)
 
-    # House rows — per-cell rendering with half-day slots.
-    # right_slot[d] = block checking IN on day d  → right half of cell
-    # left_slot[d]  = block checking OUT on day d → left half of cell
-    # full_slot[d]  = block occupying all of day d (neither checkin nor checkout)
+    # House rows. One absolutely-positioned bar per block, anchored in the cell of its
+    # first visible day; geometry is px math off the fixed cell width, so a bar's label
+    # can never widen a day column. Occupied-night cells keep the tape-occ marker.
     rows_html = ""
     for house_id, hp in props.items():
-        right_slot = {}  # checkin day → block
-        left_slot = {}   # checkout day → block
-        full_slot = {}   # full day → block
+        anchored = {}   # day → list of bar HTML, emitted inside that day's <td>
+        occupied = set()  # nights the house is booked (checkin .. checkout-1)
 
         for b in active:
             if house_id not in b.get("houses", []):
                 continue
             bc, bo = _d(b["checkin"]), _d(b["checkout"])
 
-            clipped_start = bc < win_start  # block started before visible window
-            clipped_end = bo > win_end      # block ends after visible window
+            clipped_start = bc < win_start  # block began before the visible window
+            clipped_end = bo > win_end      # checkout falls beyond the visible window
 
-            # Checkin half: right-half of checkin cell (or full if clipped at start)
-            if clipped_start:
-                # Flat left edge — mark win_start as full rather than right-half
-                if win_start not in left_slot:
-                    full_slot[win_start] = b
-            elif win_start <= bc <= win_end:
-                right_slot[bc] = b
+            night = max(bc, win_start)
+            last_night = min(bo - timedelta(days=1), win_end)
+            while night <= last_night:
+                occupied.add(night)
+                night += timedelta(days=1)
 
-            # Full days between checkin and checkout (exclusive)
-            full_first = win_start if clipped_start else bc + timedelta(days=1)
-            full_last = win_end if clipped_end else bo - timedelta(days=1)
-            cur = full_first
-            while cur <= full_last and cur <= win_end:
-                if cur not in right_slot and cur not in left_slot:
-                    full_slot[cur] = b
-                cur += timedelta(days=1)
+            anchor = win_start if clipped_start else bc
+            if not (win_start <= anchor <= win_end):
+                continue
 
-            # Checkout half: left-half of checkout cell (or omit if clipped at end)
-            if not clipped_end and win_start <= bo <= win_end:
-                left_slot[bo] = b
+            # Flat edge at a clipped window boundary, otherwise a mid-cell diagonal.
+            left_off = 0 if clipped_start else _TAPE_CELL_W // 2
+            if clipped_end:
+                right_off = (win_end - anchor).days * _TAPE_CELL_W + _TAPE_CELL_W
+            else:
+                right_off = (bo - anchor).days * _TAPE_CELL_W + _TAPE_CELL_W // 2
+            width = right_off - left_off
+            if width <= 0:
+                continue
+
+            if clipped_start and clipped_end:
+                slant = ""
+            elif clipped_start:
+                slant = " tape-slant-end"
+            elif clipped_end:
+                slant = " tape-slant-start"
+            else:
+                slant = " tape-slant-both"
+
+            edge = ("" if clipped_start else " tape-half-start") + \
+                   ("" if clipped_end else " tape-half-end")
+
+            # Under ~3 cells there is no room for text once the slants eat both ends.
+            nolabel = width < 3 * _TAPE_CELL_W
+            label = b.get("label", "?")
+            detail_url = f"/admin?tab=block&details={html_esc(b['sk'])}{kp}"
+            anchored.setdefault(anchor, []).append(
+                f'<a class="tape-bar{slant}{edge}'
+                f'{" tape-bar-nolabel" if nolabel else ""}"'
+                f' href="{detail_url}"'
+                f' style="background:{_block_color(b["sk"])};'
+                f'left:{left_off}px;width:{width}px"'
+                f' title="{html_esc(label)}"'
+                f' data-house="{html_esc(house_id)}"'
+                f' data-checkin="{html_esc(b["checkin"])}"'
+                f' data-checkout="{html_esc(b["checkout"])}">'
+                f'{"" if nolabel else html_esc(label)}</a>'
+            )
 
         cells = ""
         for d in window_days:
@@ -421,38 +456,9 @@ def _render_tape_chart(props, blocks, win_start, win_end, today_date, rules,
                 cls += " tape-today"
             if holiday_for(d, rules):
                 cls += " tape-hl"
-
-            l_blk = left_slot.get(d)
-            r_blk = right_slot.get(d)
-            f_blk = full_slot.get(d)
-
-            def _bar(b, seg_cls):
-                color = _block_color(b["sk"])
-                label = b.get("label", "?")
-                detail_url = f"/admin?tab=block&details={html_esc(b['sk'])}{kp}"
-                return (
-                    f'<a class="tape-bar tape-seg {seg_cls}"'
-                    f' href="{detail_url}"'
-                    f' style="background:{color}"'
-                    f' title="{html_esc(label)}"'
-                    f' data-house="{html_esc(house_id)}"'
-                    f' data-checkin="{html_esc(b["checkin"])}"'
-                    f' data-checkout="{html_esc(b["checkout"])}">'
-                    f'{html_esc(label)}</a>'
-                )
-
-            if l_blk and r_blk:
-                # Same-day turnover: checkout left-half + checkin right-half
-                inner = _bar(l_blk, "tape-seg-l") + _bar(r_blk, "tape-seg-r")
-                cells += f'<td class="{cls}"><div class="tape-seg-wrap">{inner}</div></td>'
-            elif l_blk:
-                cells += f'<td class="{cls}"><div class="tape-seg-wrap">{_bar(l_blk, "tape-seg-l")}</div></td>'
-            elif r_blk:
-                cells += f'<td class="{cls}"><div class="tape-seg-wrap">{_bar(r_blk, "tape-seg-r")}</div></td>'
-            elif f_blk:
-                cells += f'<td class="{cls}">{_bar(f_blk, "tape-seg-full")}</td>'
-            else:
-                cells += f'<td class="{cls}"></td>'
+            if d in occupied:
+                cls += " tape-occ"
+            cells += f'<td class="{cls}">{"".join(anchored.get(d, ()))}</td>'
 
         rows_html += (
             f'<tr><td class="tape-lc">{html_esc(hp["name"])}</td>{cells}</tr>'

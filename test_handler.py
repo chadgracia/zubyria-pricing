@@ -202,8 +202,12 @@ r = lambda_function.lambda_handler(ev("/admin", {"key": ADMIN_SECRET, "tab": "bl
 body = r["body"]
 t("T2: data-checkin present", 'data-checkin="2026-09-10"' in body)
 t("T2: data-checkout present", 'data-checkout="2026-09-13"' in body)
-t("T2: checkin shows right-half segment", 'tape-seg-r' in body)
-t("T2: checkout day shows left-half segment", 'tape-seg-l' in body)
+t("T2: bar has half-start (mid check-in cell)", 'tape-half-start' in body)
+t("T2: bar has half-end (mid check-out cell)", 'tape-half-end' in body)
+t("T2: bar slanted at both ends", 'tape-slant-both' in body)
+t("T2: 3-night bar spans 3 cells (102px)", 'width:102px' in body)
+t("T2: bar starts at mid-cell offset (17px)", 'left:17px' in body)
+t("T2: three occupied night cells", body.count('tape-occ"') == 3)
 t("T2: checkout day not in block bar data", 'data-checkin="2026-09-13"' not in body)
 
 # Tape 3 – Back-to-back blocks both render without overlap
@@ -270,7 +274,7 @@ r = lambda_function.lambda_handler(ev("/admin"), None)
 body = r["body"]
 t("T6: non-admin denied", "Access denied" in body)
 t("T6: non-admin sees no block labels", "Secret Block" not in body)
-t("T6: non-admin sees no tape chart", 'class="tape-bar"' not in body)
+t("T6: non-admin sees no tape chart", 'data-house=' not in body)
 
 # ── Acceptance tests 1–7 (new features) ────────────────────────────────────
 
@@ -657,9 +661,11 @@ lambda_function._store = _store_hd1
 r_hd1 = lambda_function.lambda_handler(
     ev("/admin", {"key": ADMIN_SECRET, "tab": "block", "month": "2026-08"}), None)
 body_hd1 = r_hd1["body"]
-t("AT_hd1: checkin day has right-half segment", 'tape-seg-r"' in body_hd1)
-t("AT_hd1: checkout day has left-half segment", 'tape-seg-l"' in body_hd1)
-t("AT_hd1: middle days have full segment", 'tape-seg-full"' in body_hd1)
+t("AT_hd1: bar has half-start at check-in", 'tape-half-start' in body_hd1)
+t("AT_hd1: bar has half-end at check-out", 'tape-half-end' in body_hd1)
+t("AT_hd1: bar slanted at both ends", 'tape-slant-both' in body_hd1)
+t("AT_hd1: 5-night bar is 170px wide", 'width:170px' in body_hd1)
+t("AT_hd1: five occupied night cells", body_hd1.count('tape-occ"') == 5)
 t("AT_hd1: data-checkin present on bar", 'data-checkin="2026-08-10"' in body_hd1)
 t("AT_hd1: data-checkout present on bar", 'data-checkout="2026-08-15"' in body_hd1)
 t("AT_hd1: legend text present", "check-in 4pm" in body_hd1)
@@ -683,7 +689,10 @@ lambda_function._store = _store_hd2
 r_hd2 = lambda_function.lambda_handler(
     ev("/admin", {"key": ADMIN_SECRET, "tab": "block", "month": "2026-08"}), None)
 body_hd2 = r_hd2["body"]
-t("AT_hd2: turnover day has wrap div (both halves)", 'class="tape-seg-wrap"' in body_hd2)
+t("AT_hd2: both bars slanted at both ends", body_hd2.count('class="tape-bar tape-slant-both') == 2)
+t("AT_hd2: departing bar ends mid-cell", 'tape-half-end' in body_hd2)
+t("AT_hd2: arriving bar starts mid-cell", 'tape-half-start' in body_hd2)
+t("AT_hd2: turnover night counted once (5+3 nights)", body_hd2.count('tape-occ"') == 8)
 t("AT_hd2: block A checkout visible on turnover day", 'data-checkout="2026-08-15"' in body_hd2)
 t("AT_hd2: block B checkin visible on turnover day", 'data-checkin="2026-08-15"' in body_hd2)
 # Conflict check: same house, overlapping dates → Conflict
@@ -707,9 +716,10 @@ lambda_function._store = _store_hd3
 r_hd3 = lambda_function.lambda_handler(
     ev("/admin", {"key": ADMIN_SECRET, "tab": "block", "month": "2026-08"}), None)
 body_hd3 = r_hd3["body"]
-t("AT_hd3: clipped-start has no right-half at window edge", 'tape-seg-r"' not in body_hd3)
-t("AT_hd3: clipped-start has full bar at window start", 'tape-seg-full"' in body_hd3)
-t("AT_hd3: clipped-start has left-half for checkout day", 'tape-seg-l"' in body_hd3)
+t("AT_hd3: clipped-start has flat leading edge (no half-start)", 'tape-half-start' not in body_hd3)
+t("AT_hd3: clipped-start bar begins at cell edge", 'left:0px' in body_hd3)
+t("AT_hd3: clipped-start slants only at the trailing end", 'tape-slant-end' in body_hd3)
+t("AT_hd3: clipped-start keeps half-end at check-out", 'tape-half-end' in body_hd3)
 
 # AT_hd4 – clipped right edge: block ends after window → no left-half beyond window
 # Window for month=2026-08 spans Aug 1 – Sep 30; use checkout=2026-10-05 to clip right edge
@@ -724,9 +734,40 @@ lambda_function._store = _store_hd4
 r_hd4 = lambda_function.lambda_handler(
     ev("/admin", {"key": ADMIN_SECRET, "tab": "block", "month": "2026-08"}), None)
 body_hd4 = r_hd4["body"]
-t("AT_hd4: clipped-end has right-half for checkin day", 'tape-seg-r"' in body_hd4)
-t("AT_hd4: clipped-end has no left-half (checkout beyond window)", 'tape-seg-l"' not in body_hd4)
-t("AT_hd4: clipped-end has full segment for middle days", 'tape-seg-full"' in body_hd4)
+t("AT_hd4: clipped-end keeps half-start at check-in", 'tape-half-start' in body_hd4)
+t("AT_hd4: clipped-end has flat trailing edge (no half-end)", 'tape-half-end' not in body_hd4)
+t("AT_hd4: clipped-end slants only at the leading edge", 'tape-slant-start' in body_hd4)
+
+# AT_hd5 – compact column width preserved in the rendered CSS
+t("AT_hd5: day cells keep 34px min-width", ".tape-dc{min-width:34px" in body_hd1)
+t("AT_hd5: day cells capped at 34px", "max-width:34px" in body_hd1)
+t("AT_hd5: day headers keep 34px min-width", ".tape-dh{min-width:34px" in body_hd1)
+t("AT_hd5: chart stays horizontally scrollable", "overflow-x:auto" in body_hd1)
+t("AT_hd5: house column stays sticky", "position:sticky" in body_hd1)
+t("AT_hd5: bars are absolutely positioned (cannot widen cells)",
+  ".tape-bar{position:absolute" in body_hd1)
+t("AT_hd5: diagonal edges use clip-path", "clip-path:polygon" in body_hd1)
+t("AT_hd5: cell width constant matches CSS", lambda_function._TAPE_CELL_W == 34)
+
+# AT_hd6 – Fri→Sun: Fri right-portion start, Sat full night, Sun left-portion end
+# 2026-08-14 is a Friday; checkout 2026-08-16 is a Sunday.
+_store_hd6 = FakeStore([{
+    "pk": "blocks", "sk": "block#hd6",
+    "houses": ["tseglina"],
+    "checkin": "2026-08-14", "checkout": "2026-08-16",
+    "label": "Weekend", "created_by": "admin", "status": "active",
+}])
+lambda_function._store = _store_hd6
+r_hd6 = lambda_function.lambda_handler(
+    ev("/admin", {"key": ADMIN_SECRET, "tab": "block", "month": "2026-08"}), None)
+body_hd6 = r_hd6["body"]
+t("AT_hd6: Fri check-in starts mid-cell", 'tape-half-start' in body_hd6)
+t("AT_hd6: Sun check-out ends mid-cell", 'tape-half-end' in body_hd6)
+t("AT_hd6: bar anchored at Fri offset 17px", 'left:17px' in body_hd6)
+t("AT_hd6: 2 nights → 68px (mid-Fri to mid-Sun)", 'width:68px' in body_hd6)
+t("AT_hd6: exactly 2 occupied nights (Fri, Sat)", body_hd6.count('tape-occ"') == 2)
+t("AT_hd6: short bar hides inline label", 'tape-bar-nolabel' in body_hd6)
+t("AT_hd6: hidden label still available as tooltip", 'title="Weekend"' in body_hd6)
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 print()
