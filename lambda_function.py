@@ -54,13 +54,16 @@ input[type=text],select,input[type=number]{background:var(--bg);color:var(--ink)
 border-radius:4px;padding:7px 9px;font:14px Verdana,sans-serif}
 input[type=number]{width:70px}
 .row{display:flex;flex-wrap:wrap;gap:14px;align-items:center}
-.house{display:flex;flex-direction:column;gap:8px;background:var(--bg);border:1px solid #3d4741;border-radius:6px;padding:10px;width:190px}
-.house img{width:100%;height:100px;object-fit:cover;border-radius:4px}
-.nophoto{width:100%;height:100px;border-radius:4px;background:#333c36;display:flex;align-items:center;justify-content:center;font-size:34px;color:var(--dim)}
+.house{display:flex;flex-direction:column;gap:8px;background:var(--bg);border:1px solid #3d4741;border-radius:6px;padding:10px;width:230px}
+.house img{width:100%;height:130px;object-fit:cover;border-radius:4px}
+.nophoto{width:100%;height:130px;border-radius:4px;background:#333c36;display:flex;align-items:center;justify-content:center;font-size:34px;color:var(--dim)}
 .houserow{display:flex;align-items:center;gap:8px}
 button{background:var(--accent);color:#221c10;border:0;border-radius:4px;padding:10px 26px;
 font:bold 14px Verdana,sans-serif;letter-spacing:.06em;cursor:pointer}
 button:hover{filter:brightness(1.1)}
+.btn-sec{background:transparent;color:var(--dim);border:1px solid #3d4741;border-radius:4px;padding:10px 26px;
+font:14px Verdana,sans-serif;letter-spacing:.06em;cursor:pointer;text-decoration:none;display:inline-block}
+.btn-sec:hover{color:var(--ink);border-color:#9aa69d}
 .result{margin-top:26px;background:var(--panel);border:1px solid #333c36;border-radius:6px;padding:20px}
 .result h2{font-size:15px;font-family:Verdana,sans-serif;letter-spacing:.14em;text-transform:uppercase;
 color:var(--dim);font-weight:normal;margin:0 0 12px}
@@ -100,7 +103,7 @@ def render_page(props: dict, params=None, q: Quote = None, error=None):
                     f'<span class="bonus">Anya\'s bonus (20%): ${q.anya_bonus:,.2f}</span></div>'
                     f'<details style="margin-top:14px"><summary style="cursor:pointer;color:var(--dim);font:12px Verdana">Show reasoning</summary>'
                     f'<div class="line" style="margin-top:8px">{lines}</div></details>'
-                    f'<div style="color:var(--dim);font-size:11px;margin-top:8px;font-family:Verdana">rules: {q.rules_source}</div>')
+                    f'<div style="color:var(--dim);font-size:11px;margin-top:8px;font-family:Verdana">rules: {q.rules_source} &nbsp;·&nbsp; <a href="/?refresh_rules=1" style="color:var(--dim)">refresh rules</a></div>')
         result_html = f'<div class="result"><h2>Quote &amp; reasoning</h2>{body}</div>'
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -121,10 +124,11 @@ def render_page(props: dict, params=None, q: Quote = None, error=None):
 <label>Booking type <select name="btype">
 <option value="cash" {sel('btype','cash','cash')}>Cash (0%)</option>
 <option value="airbnb" {sel('btype','airbnb')}>Airbnb (15.5%)</option>
-<option value="monobank" {sel('btype','monobank')}>Website — Monobank (1.3%)</option>
-<option value="stripe" {sel('btype','stripe')}>Website — Stripe (~5.5%)</option></select></label>
+<option value="monobank" {sel('btype','monobank')}>Site — UA card (1.3%)</option>
+<option value="stripe" {sel('btype','stripe')}>Site — Int'l card (5.5%)</option></select></label>
 </div></fieldset>
 <button type="submit">Calculate price</button>
+<a href="/" class="btn-sec" style="margin-left:10px">Reset</a>
 </form>{result_html}</div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/flatpickr/4.6.13/flatpickr.min.js"></script>
 <script>
@@ -134,6 +138,9 @@ flatpickr('#dates', {{mode:'range', dateFormat:'Y-m-d', minDate:'today', showMon
 def lambda_handler(event, context):
     path = event.get("rawPath", "/")
     qs = event.get("queryStringParameters") or {}
+    if qs.get("refresh_rules"):
+        load_rules(force_refresh=True)
+        return _resp(200, render_page(load_rules()["properties"]))
     props = load_rules()["properties"]
     wants_json = path.rstrip("/").endswith("quote.json")
     if not (qs.get("checkin") or qs.get("dates")):

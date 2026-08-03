@@ -61,8 +61,8 @@ FALLBACK_RULES = {
 BOOKING_TYPES = {
     "airbnb":   dict(fee=0.155, commission=True,  label="Airbnb (15.5% commission)"),
     "cash":     dict(fee=0.0,   commission=False, label="Cash"),
-    "monobank": dict(fee=0.013, commission=False, label="Website — Monobank (1.3%)"),
-    "stripe":   dict(fee=0.055, commission=False, label="Website — Stripe (~5.5%)"),
+    "monobank": dict(fee=0.013, commission=False, label="Site — UA card (1.3%)"),
+    "stripe":   dict(fee=0.055, commission=False, label="Site — Int'l card (5.5%)"),
 }
 BONUS_PCT = 0.20
 
