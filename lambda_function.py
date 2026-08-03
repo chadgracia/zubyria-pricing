@@ -789,9 +789,20 @@ def _access_denied():
     )
 
 
+def _error_page():
+    return (
+        '<!doctype html><html><head><meta charset="utf-8">'
+        f'<style>{CSS}</style></head><body><div class="wrap">'
+        '<h1>Zubyria <b>Error</b></h1>'
+        '<p class="err">An internal error occurred. Please try again.</p>'
+        '<a href="/" class="btn-sec">← Calculator</a>'
+        '</div></body></html>'
+    )
+
+
 # ---------- Lambda handler ----------
 
-def lambda_handler(event, context):
+def _lambda_handler(event, context):
     path = event.get("rawPath", "/")
     qs = event.get("queryStringParameters") or {}
     admin = is_admin(event)
@@ -1042,3 +1053,16 @@ def _resp(status, body, json_=False):
         "headers": {"Content-Type": "application/json" if json_ else "text/html; charset=utf-8"},
         "body": json.dumps(body) if json_ else body,
     }
+
+
+def lambda_handler(event, context):
+    try:
+        return _lambda_handler(event, context)
+    except Exception as exc:
+        import traceback
+        print(f"UNHANDLED EXCEPTION:\n{traceback.format_exc()}")
+        path = (event.get("rawPath") or "/").rstrip("/")
+        wants_json = path.endswith("quote.json") or path.endswith("availability.json")
+        if wants_json:
+            return _resp(500, {"error": str(exc) or "Internal server error"}, json_=True)
+        return _resp(500, _error_page())

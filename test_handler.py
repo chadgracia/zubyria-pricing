@@ -453,6 +453,95 @@ r_pub = lambda_function.lambda_handler(ev("/", {
 }), None)
 t("AT7: public New Year quote still no Anya", "Anya" not in r_pub["body"])
 
+# ── AT_D: Decimal-safe DynamoDB & error-handler tests ────────────────────────
+
+print("\n=== Decimal / error-handler tests ===")
+
+from decimal import Decimal
+from reservations import Store
+
+
+class StrictDynamoTable:
+    """Mock DynamoDB table that raises TypeError on float values (like real DynamoDB)."""
+    def __init__(self):
+        self._items = []
+
+    def _check_no_floats(self, obj, path="root"):
+        if isinstance(obj, float):
+            raise TypeError(f"Float types are not supported at '{path}'. Use Decimal instead.")
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                self._check_no_floats(v, f"{path}.{k}")
+        elif isinstance(obj, list):
+            for i, v in enumerate(obj):
+                self._check_no_floats(v, f"{path}[{i}]")
+
+    def put_item(self, Item):
+        self._check_no_floats(Item)
+        self._items.append(dict(Item))
+
+    def update_item(self, Key, UpdateExpression, ExpressionAttributeNames, ExpressionAttributeValues):
+        for item in self._items:
+            if item.get("pk") == Key["pk"] and item.get("sk") == Key["sk"]:
+                item["status"] = ExpressionAttributeValues[":s"]
+
+    def query(self, KeyConditionExpression, ExpressionAttributeValues, **kw):
+        pk_val = ExpressionAttributeValues[":pk"]
+        return {"Items": [dict(i) for i in self._items if i.get("pk") == pk_val]}
+
+
+# AT_D1 – add_block with float snapshot passes through StrictDynamoTable without raising
+_strict_tbl = StrictDynamoTable()
+_strict_store = Store(_strict_tbl)
+try:
+    result = _strict_store.add_block(
+        houses=["tseglina"],
+        checkin=date(2026, 11, 1),
+        checkout=date(2026, 11, 3),
+        label="Decimal test",
+        snapshot={"subtotal": 300.0, "gross_profit": 250.0, "bonus": 50.0},
+    )
+    t("AT_D1: add_block with float snapshot doesn't raise", result.get("ok") is True)
+except TypeError as e:
+    t("AT_D1: add_block with float snapshot doesn't raise", False)
+    print(f"  >> TypeError: {e}")
+
+# AT_D2 – list_blocks returns Python floats/ints (not Decimal) after round-trip
+_items_d2 = _strict_store.list_blocks()
+t("AT_D2: list_blocks returned items", len(_items_d2) == 1)
+snap_d2 = _items_d2[0].get("snapshot", {})
+t("AT_D2: subtotal is native numeric not Decimal", isinstance(snap_d2.get("subtotal"), (int, float)) and not isinstance(snap_d2.get("subtotal"), Decimal))
+t("AT_D2: gross_profit is native numeric not Decimal", isinstance(snap_d2.get("gross_profit"), (int, float)) and not isinstance(snap_d2.get("gross_profit"), Decimal))
+
+# AT_D3 – handler wraps unhandled exceptions → 500 HTML for non-JSON routes
+class BrokenAddStore(FakeStore):
+    def add_block(self, *a, **kw):
+        raise RuntimeError("simulated DynamoDB failure")
+
+lambda_function._store = BrokenAddStore()
+r_d3 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "action": "add_block",
+    "dates": "2026-11-05 to 2026-11-08",
+    "h_tseglina": "on", "label": "Crash test",
+}), None)
+t("AT_D3: unhandled exception → 500", r_d3["statusCode"] == 500)
+t("AT_D3: 500 body is HTML error page", "internal error" in r_d3["body"].lower())
+
+# AT_D4 – handler wraps unhandled exceptions → 500 JSON for /availability.json
+class BrokenAvailStore(FakeStore):
+    def availability(self, checkin, checkout, exclude_id=None):
+        raise RuntimeError("simulated availability failure")
+
+lambda_function._store = BrokenAvailStore()
+r_d4 = lambda_function.lambda_handler(ev("/availability.json", {
+    "checkin": "2026-11-05",
+    "checkout": "2026-11-08",
+}), None)
+t("AT_D4: json route unhandled exception → 500", r_d4["statusCode"] == 500)
+import json as _json
+_body_d4 = _json.loads(r_d4["body"])
+t("AT_D4: 500 JSON has 'error' key", "error" in _body_d4)
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 print()
 print(f"Results: {_passed} passed, {_failed} failed out of {_passed + _failed}")

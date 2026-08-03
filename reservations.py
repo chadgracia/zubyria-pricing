@@ -6,9 +6,37 @@ Occupied nights: [checkin, checkout) — checkout day is free for the next check
 """
 import datetime
 import uuid
+from decimal import Decimal
 
 TABLE_NAME = "zubyria-reservations"
 REGION = "us-east-1"
+
+
+def _to_dynamo(obj):
+    """Recursively convert Python floats to Decimal for DynamoDB storage."""
+    if isinstance(obj, float):
+        return Decimal(str(obj))
+    if isinstance(obj, bool):
+        return obj  # bool before int: bool is subclass of int
+    if isinstance(obj, int):
+        return obj
+    if isinstance(obj, dict):
+        return {k: _to_dynamo(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_dynamo(v) for v in obj]
+    return obj
+
+
+def _from_dynamo(obj):
+    """Recursively convert DynamoDB Decimal back to float (or int if whole number)."""
+    if isinstance(obj, Decimal):
+        f = float(obj)
+        return int(f) if f == int(f) else f
+    if isinstance(obj, dict):
+        return {k: _from_dynamo(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_from_dynamo(v) for v in obj]
+    return obj
 
 
 def _overlaps(ci1, co1, ci2, co2):
@@ -36,7 +64,7 @@ class Store:
             if "LastEvaluatedKey" not in r:
                 break
             kw["ExclusiveStartKey"] = r["LastEvaluatedKey"]
-        return items
+        return [_from_dynamo(item) for item in items]
 
     def availability(self, checkin, checkout, exclude_id=None):
         """Return {house_id: {"available": False, "blocked_by": label}} for every house
@@ -86,7 +114,7 @@ class Store:
             item["quote_params"] = quote_params
         if btype:
             item["btype"] = btype
-        self._t.put_item(Item=item)
+        self._t.put_item(Item=_to_dynamo(item))
         return {"ok": True, "id": sk}
 
     def cancel_block(self, block_id):
