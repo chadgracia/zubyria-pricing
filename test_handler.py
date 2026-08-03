@@ -235,7 +235,7 @@ r = lambda_function.lambda_handler(ev("/admin", {"key": ADMIN_SECRET, "tab": "bl
 body = r["body"]
 t("T4: New Year holiday marker in Dec window", "New Year" in body)
 
-# Tape 5 – cancel_confirm flow: bar link shows details + Cancel; after cancel bar gone
+# Tape 5 – details flow: bar link shows Details panel; cancel two-step; after cancel bar gone
 _store_t5 = FakeStore([{
     "pk": "blocks", "sk": "block#cc1",
     "houses": ["modryna"],
@@ -243,14 +243,14 @@ _store_t5 = FakeStore([{
     "label": "Confirm Cancel Test", "created_by": "admin", "status": "active",
 }])
 lambda_function._store = _store_t5
-# Step A: cancel_confirm shows detail panel
+# Step A: details param shows Details panel with label and controls
 r = lambda_function.lambda_handler(ev("/admin", {
-    "key": ADMIN_SECRET, "tab": "block", "cancel_confirm": "block#cc1", "month": "2026-09",
+    "key": ADMIN_SECRET, "tab": "block", "details": "block#cc1", "month": "2026-09",
 }), None)
 body = r["body"]
-t("T5: cancel_confirm shows label", "Confirm Cancel Test" in body)
-t("T5: cancel_confirm shows cancel action link", "cancel_block" in body)
-t("T5: cancel_confirm shows 'Yes, cancel'", "Yes, cancel" in body)
+t("T5: details panel shows label", "Confirm Cancel Test" in body)
+t("T5: details panel shows 'Details' title", "Details" in body)
+t("T5: details panel shows Edit control", "Edit" in body)
 # Step B: after actual cancel, bar gone
 r = lambda_function.lambda_handler(ev("/admin", {
     "key": ADMIN_SECRET, "tab": "block", "action": "cancel_block",
@@ -452,6 +452,105 @@ r_pub = lambda_function.lambda_handler(ev("/", {
     "jacuzzi": "0", "btype": "cash",
 }), None)
 t("AT7: public New Year quote still no Anya", "Anya" not in r_pub["body"])
+
+# ── AT_det: Unified Details popup tests ──────────────────────────────────────
+
+print("\n=== Details popup tests ===")
+
+_snap_block = {
+    "pk": "blocks", "sk": "block#det1",
+    "houses": ["tseglina", "zharyna"],
+    "checkin": "2026-09-10", "checkout": "2026-09-13",
+    "label": "Details Test Guest", "created_by": "admin",
+    "created_at": "2026-08-01T10:00:00",
+    "status": "active",
+    "btype": "monobank",
+    "snapshot": {"subtotal": 500.0, "gross_profit": 450.0, "bonus": 90.0},
+    "quote_params": {"houses": {"tseglina": 3, "zharyna": 2}, "jacuzzi": 0, "pets": 0,
+                     "btype": "monobank", "event": False, "event_guests": 0},
+}
+_plain_block = {
+    "pk": "blocks", "sk": "block#det2",
+    "houses": ["modryna"],
+    "checkin": "2026-09-15", "checkout": "2026-09-17",
+    "label": "Plain Maintenance", "created_by": "admin",
+    "created_at": "2026-08-01T11:00:00",
+    "status": "active",
+}
+_store_det = FakeStore([_snap_block, _plain_block])
+lambda_function._store = _store_det
+
+# AT_det1 – Snapshot block: Details panel contains all required content and 3 controls
+r_det1 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "details": "block#det1", "month": "2026-09",
+}), None)
+body_det1 = r_det1["body"]
+t("AT_det1: Details panel title 'Details'", "<h2>Details</h2>" in body_det1)
+t("AT_det1: label present", "Details Test Guest" in body_det1)
+t("AT_det1: house names present", "Tseglina" in body_det1 and "Zharyna" in body_det1)
+t("AT_det1: night count present", "3 nights" in body_det1)
+t("AT_det1: bonus value present", "90.00" in body_det1)
+t("AT_det1: Anya bonus label present", "Anya" in body_det1)
+t("AT_det1: guest pays present", "500.00" in body_det1)
+t("AT_det1: gross profit present", "450.00" in body_det1)
+t("AT_det1: Edit control present", ">Edit<" in body_det1)
+t("AT_det1: Cancel control present", ">Cancel<" in body_det1)
+t("AT_det1: Done control present", ">Done<" in body_det1)
+t("AT_det1: priced-for summary present", "Tseglina: 3 guests" in body_det1)
+
+# AT_det2 – Non-snapshot block: "No pricing recorded" shown, bonus not present
+r_det2 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "details": "block#det2", "month": "2026-09",
+}), None)
+body_det2 = r_det2["body"]
+t("AT_det2: non-snapshot block shows label", "Plain Maintenance" in body_det2)
+t("AT_det2: 'No pricing recorded' shown", "No pricing recorded" in body_det2)
+t("AT_det2: no bonus line", "Anya" not in body_det2)
+
+# AT_det3 – Cancel two-step: first request (details only) does NOT cancel; block still active
+lambda_function._store = FakeStore([dict(_snap_block)])
+r_det3a = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "details": "block#det1", "month": "2026-09",
+}), None)
+t("AT_det3: first click — block still active", any(
+    b.get("sk") == "block#det1" and b.get("status") == "active"
+    for b in lambda_function._store._blocks
+))
+# confirm_cancel=1 shows "Confirm cancel" button but does NOT cancel
+r_det3b = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "details": "block#det1",
+    "confirm_cancel": "1", "month": "2026-09",
+}), None)
+t("AT_det3: confirm_cancel=1 shows Confirm cancel", "Confirm cancel" in r_det3b["body"])
+t("AT_det3: confirm_cancel=1 does NOT cancel block", any(
+    b.get("sk") == "block#det1" and b.get("status") == "active"
+    for b in lambda_function._store._blocks
+))
+
+# AT_det4 – action=cancel_block (Confirm cancel link) actually cancels
+r_det4 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "action": "cancel_block",
+    "block_id": "block#det1",
+}), None)
+t("AT_det4: action=cancel_block cancels block", all(
+    b.get("status") == "cancelled"
+    for b in lambda_function._store._blocks
+    if b.get("sk") == "block#det1"
+))
+
+# AT_det5 – Done link points back to BLOCK tab chart
+lambda_function._store = FakeStore([dict(_snap_block)])
+r_det5 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "details": "block#det1", "month": "2026-09",
+}), None)
+t("AT_det5: Done href targets block tab", 'tab=block' in r_det5["body"] and '>Done<' in r_det5["body"])
+
+# AT_det6 – Non-admin cannot see the details panel
+r_det6 = lambda_function.lambda_handler(ev("/admin", {
+    "tab": "block", "details": "block#det1",
+}), None)
+t("AT_det6: non-admin cannot see Details panel", "Details Test Guest" not in r_det6["body"])
+t("AT_det6: non-admin sees access denied", "Access denied" in r_det6["body"])
 
 # ── AT_D: Decimal-safe DynamoDB & error-handler tests ────────────────────────
 

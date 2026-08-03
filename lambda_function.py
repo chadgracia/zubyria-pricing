@@ -328,7 +328,7 @@ def _calc_form_html(props: dict, v: dict, avail: dict, form_action: str,
 
 
 def _render_tape_chart(props, blocks, win_start, win_end, today_date, rules,
-                        cancel_confirm_block=None, admin_key=""):
+                        detail_block=None, admin_key=""):
     kp = f"&key={admin_key}" if admin_key else ""
     n_days = (win_end - win_start).days + 1
     window_days = [win_start + timedelta(days=i) for i in range(n_days)]
@@ -401,7 +401,7 @@ def _render_tape_chart(props, blocks, win_start, win_end, today_date, rules,
                     span += 1
                 color = _block_color(b["sk"])
                 label = b.get("label", "?")
-                cancel_url = f"/admin?tab=block&cancel_confirm={html_esc(b['sk'])}{kp}"
+                detail_url = f"/admin?tab=block&details={html_esc(b['sk'])}{kp}"
                 data = (
                     f' data-house="{html_esc(house_id)}"'
                     f' data-checkin="{html_esc(b["checkin"])}"'
@@ -409,7 +409,7 @@ def _render_tape_chart(props, blocks, win_start, win_end, today_date, rules,
                 )
                 cells += (
                     f'<td class="{cls}" colspan="{span}"{data}>'
-                    f'<a class="tape-bar" href="{cancel_url}" '
+                    f'<a class="tape-bar" href="{detail_url}" '
                     f'style="background:{color}" title="{html_esc(label)}">'
                     f'{html_esc(label)}</a></td>'
                 )
@@ -455,7 +455,8 @@ def render_page(props: dict, params=None, q: Quote = None, error=None,
 
 def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
                  tab="block", q=None, price_error=None, price_params=None,
-                 avail=None, block_url=None, month_str="", cancel_confirm_block=None):
+                 avail=None, block_url=None, month_str="", detail_block=None,
+                 confirm_cancel=False):
     pf = prefill or {}
     kp = f"&key={admin_key}" if admin_key else ""
     key_hidden = f'<input type="hidden" name="key" value="{html_esc(admin_key)}">' if admin_key else ""
@@ -596,16 +597,23 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
         rules = load_rules()
         tape_html = _render_tape_chart(
             props, blocks, win_start, win_end, today_date, rules,
-            cancel_confirm_block=cancel_confirm_block, admin_key=admin_key,
+            detail_block=detail_block, admin_key=admin_key,
         )
 
-        # Cancel confirm panel — includes Edit link
-        if cancel_confirm_block:
-            b = cancel_confirm_block
+        # Details panel (shown when a tape bar is clicked)
+        if detail_block:
+            b = detail_block
             houses_str = ", ".join(props.get(h, {}).get("name", h) for h in b.get("houses", []))
-            # Build Edit URL
+            try:
+                nights = (_d(b["checkout"]) - _d(b["checkin"])).days
+            except (KeyError, ValueError):
+                nights = 0
+            nights_label = f"{nights} night{'s' if nights != 1 else ''}"
+            created_at_short = (b.get("created_at") or "")[:10]
+
+            # Build Edit URL (pre-fills the block form)
             edit_parts = [
-                f"tab=block",
+                "tab=block",
                 f"edit_id={urllib.parse.quote(b['sk'], safe='')}",
                 f"dates={urllib.parse.quote(b['checkin'] + ' to ' + b['checkout'], safe='')}",
             ]
@@ -628,18 +636,94 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
             if admin_key:
                 edit_parts.append(f"key={urllib.parse.quote(admin_key, safe='')}")
             edit_url = "/admin?" + "&".join(edit_parts)
+
+            # Financial section
+            from pricing_engine import BOOKING_TYPES as _BT
+            snap = b.get("snapshot")
+            if snap:
+                btype_key = b.get("btype", "cash")
+                bt_info = _BT.get(btype_key, {})
+                bt_label = bt_info.get("label", btype_key)
+                subtotal = snap.get("subtotal", 0)
+                gross_profit = snap.get("gross_profit", 0)
+                bonus = snap.get("bonus", 0)
+                fee_rate = bt_info.get("fee", 0.0)
+                fee_amount = round(subtotal * fee_rate, 2) if fee_rate else 0.0
+                fee_html = ""
+                if fee_amount:
+                    fee_label = "Airbnb commission" if bt_info.get("commission") else "Processing fee"
+                    fee_html = f'<br>{html_esc(fee_label)}: ${fee_amount:,.2f}'
+                finance_html = (
+                    f'<div class="tot" style="border-top:0;margin-top:8px;padding-top:0">'
+                    f'<span style="color:var(--dim);font-size:11px;font-family:Verdana">'
+                    f'{html_esc(bt_label)}</span><br>'
+                    f'Guest pays: <b>${subtotal:,.2f}</b>{fee_html}'
+                    f'<br>Gross profit: ${gross_profit:,.2f} &nbsp;·&nbsp; '
+                    f'<span class="bonus">Anya\'s bonus (20%): ${bonus:,.2f}</span>'
+                    f'</div>'
+                )
+                # Quote params summary
+                qp = b.get("quote_params") or {}
+                if qp:
+                    qp_parts = []
+                    if isinstance(qp.get("houses"), dict):
+                        for h, g in qp["houses"].items():
+                            qp_parts.append(f"{props.get(h, {}).get('name', h)}: {g} guests")
+                    if qp.get("jacuzzi"):
+                        qp_parts.append(f"Jacuzzi: {qp['jacuzzi']} uses")
+                    if qp.get("pets"):
+                        qp_parts.append(f"Pets: {qp['pets']}")
+                    if qp.get("event"):
+                        qp_parts.append(f"Event, {qp.get('event_guests', 0)} guests")
+                    if qp_parts:
+                        finance_html += (
+                            f'<div style="margin-top:6px;font-size:12px;font-family:Verdana;'
+                            f'color:var(--dim)">Priced for: {html_esc(", ".join(qp_parts))}</div>'
+                        )
+            else:
+                finance_html = (
+                    f'<p style="color:var(--dim);font-size:13px;font-family:Verdana;margin:8px 0 0">'
+                    f'No pricing recorded</p>'
+                )
+
+            # Two-step cancel: first click shows confirm_cancel on same page;
+            # second click (Confirm cancel) triggers the actual cancel action.
+            cancel_step1_url = (
+                f"/admin?tab=block&details={urllib.parse.quote(b['sk'], safe='')}"
+                f"&confirm_cancel=1{kp}"
+            )
+            cancel_step2_url = (
+                f"/admin?tab=block&action=cancel_block"
+                f"&block_id={urllib.parse.quote(b['sk'], safe='')}{kp}"
+            )
+            if confirm_cancel:
+                cancel_btn = (
+                    f'<a href="{html_esc(cancel_step2_url)}" class="btn-sec" '
+                    f'style="color:var(--err);border-color:var(--err)">Confirm cancel</a>'
+                )
+            else:
+                cancel_btn = (
+                    f'<a href="{html_esc(cancel_step1_url)}" class="btn-sec" '
+                    f'style="color:var(--err);border-color:var(--err)">Cancel</a>'
+                )
+
+            done_url = f"/admin?tab=block{kp}"
             confirm_html = (
-                f'<div class="result" style="border-color:var(--err);margin-bottom:20px">'
-                f'<h2 style="color:var(--err)">Cancel Block?</h2>'
-                f'<p><b>{html_esc(b.get("label","?"))}</b><br>'
+                f'<div class="result" style="margin-bottom:20px">'
+                f'<h2>Details</h2>'
+                f'<p style="margin-bottom:4px"><b>{html_esc(b.get("label","?"))}</b><br>'
                 f'Houses: {html_esc(houses_str)}<br>'
-                f'{html_esc(b.get("checkin",""))} → {html_esc(b.get("checkout",""))}<br>'
-                f'Created by: {html_esc(b.get("created_by",""))}</p>'
-                f'<a href="{html_esc(edit_url)}" class="btn-sec" style="margin-right:8px">Edit this block</a>'
-                f'<a href="/admin?tab=block&action=cancel_block&block_id={urllib.parse.quote(b["sk"], safe="")}{kp}" '
-                f'class="btn-sec" style="color:var(--err);border-color:var(--err)">'
-                f'Yes, cancel this block</a>'
-                f'&nbsp;<a href="/admin?tab=block{kp}" class="btn-sec">Never mind</a>'
+                f'{html_esc(b.get("checkin",""))} → {html_esc(b.get("checkout",""))}'
+                f' ({html_esc(nights_label)})<br>'
+                f'Created by: {html_esc(b.get("created_by",""))}'
+                f'{(" · " + html_esc(created_at_short)) if created_at_short else ""}</p>'
+                f'{finance_html}'
+                f'<div style="border-top:1px solid #2a322d;margin-top:14px;padding-top:12px;'
+                f'display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+                f'<a href="{html_esc(edit_url)}" class="btn-sec">Edit</a>'
+                f'{cancel_btn}'
+                f'<a href="{html_esc(done_url)}" class="btn-sec">Done</a>'
+                f'</div>'
                 f'</div>'
             )
         else:
@@ -654,12 +738,12 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
             rows = ""
             for b in upcoming:
                 houses_str = ", ".join(props.get(h, {}).get("name", h) for h in b.get("houses", []))
-                detail_url = f"/admin?tab=block&cancel_confirm={urllib.parse.quote(b['sk'], safe='')}{kp}"
+                det_url = f"/admin?tab=block&details={urllib.parse.quote(b['sk'], safe='')}{kp}"
                 rows += (
                     f'<li style="margin-bottom:8px">'
                     f'<b>{html_esc(b.get("label","?"))}</b>: {html_esc(houses_str)}, '
                     f'{html_esc(b.get("checkin",""))} → {html_esc(b.get("checkout",""))}'
-                    f' &nbsp;<a href="{detail_url}" style="color:var(--dim);font-size:12px">[details/cancel]</a>'
+                    f' &nbsp;<a href="{det_url}" style="color:var(--dim);font-size:12px">[details]</a>'
                     f'</li>'
                 )
             blocks_html = f'<ul style="padding-left:20px;margin:8px 0 0">{rows}</ul>'
@@ -954,13 +1038,14 @@ def _lambda_handler(event, context):
         except Exception:
             blocks = []
 
-        # Resolve cancel_confirm block (block tab only)
-        cancel_confirm_block = None
-        cancel_confirm_id = qs.get("cancel_confirm", "")
-        if cancel_confirm_id and tab == "block":
+        # Resolve detail block (block tab only)
+        detail_block = None
+        detail_id = qs.get("details", "")
+        confirm_cancel = bool(qs.get("confirm_cancel"))
+        if detail_id and tab == "block":
             for b in blocks:
-                if b.get("sk") == cancel_confirm_id and b.get("status") == "active":
-                    cancel_confirm_block = b
+                if b.get("sk") == detail_id and b.get("status") == "active":
+                    detail_block = b
                     break
 
         admin_key = ADMIN_SECRET if via_key else ""
@@ -968,7 +1053,8 @@ def _lambda_handler(event, context):
             props, blocks, msg=msg, prefill=prefill, admin_key=admin_key,
             tab=tab, q=q_price, price_error=price_error, price_params=dict(qs),
             avail=price_avail, block_url=price_block_url,
-            month_str=month_str, cancel_confirm_block=cancel_confirm_block,
+            month_str=month_str, detail_block=detail_block,
+            confirm_cancel=confirm_cancel,
         ))
         if via_key:
             resp["cookies"] = [_admin_cookie()]
