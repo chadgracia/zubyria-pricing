@@ -6,14 +6,43 @@ GET  /admin              -> Admin page (requires ?key= or zadmin cookie)
 GET  /availability.json  -> Public availability dict (blocked_by stripped for non-admin)
 """
 import json
-from datetime import date
-from pricing_engine import quote, load_rules, Quote
+from datetime import date, timedelta
+from pricing_engine import quote, load_rules, Quote, holiday_for
 
 ADMIN_SECRET = "zubyria$admin!7kQ2mXf9pLw4"
 
 # Module-level store; None = lazy-init to real DynamoDB.
 # Tests override this directly: lambda_function._store = FakeStore(...)
 _store = None
+
+_BLOCK_COLORS = ["#4e7a5b", "#4a6080", "#7a5a4a", "#6a4f80", "#3d7070"]
+
+
+def _d(s):
+    return date.fromisoformat(s)
+
+
+def _block_color(sk):
+    return _BLOCK_COLORS[hash(sk) % len(_BLOCK_COLORS)]
+
+
+def _prev_month(y, m):
+    m -= 1
+    if m == 0:
+        return y - 1, 12
+    return y, m
+
+
+def _next_month_ym(y, m):
+    m += 1
+    if m == 13:
+        return y + 1, 1
+    return y, m
+
+
+def _month_end(y, m):
+    ny, nm = _next_month_ym(y, m)
+    return date(ny, nm, 1) - timedelta(days=1)
 
 
 def _get_store():
@@ -94,6 +123,28 @@ color:var(--dim);font-weight:normal;margin:0 0 12px}
 border:1px solid transparent;border-bottom:0;margin-bottom:-1px;border-radius:4px 4px 0 0}
 .tab-nav a.active{color:var(--accent);border-color:#333c36;background:var(--panel)}
 .tab-nav a:not(.active):hover{color:var(--ink)}
+.tape-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 0 20px}
+.tape-tbl{border-collapse:collapse;table-layout:fixed}
+.tape-tbl th,.tape-tbl td{padding:0;border:1px solid #2a322d;vertical-align:middle}
+.tape-lh{width:80px;min-width:80px;position:sticky;left:0;z-index:2;background:var(--panel);
+font:11px Verdana,sans-serif;color:var(--dim);padding:4px 6px;text-align:left}
+.tape-lc{width:80px;min-width:80px;position:sticky;left:0;z-index:1;background:var(--bg);
+font:12px Verdana,sans-serif;color:var(--ink);padding:4px 6px;white-space:nowrap;
+overflow:hidden;text-overflow:ellipsis}
+.tape-dh{min-width:34px;width:34px;text-align:center;font:10px Verdana,sans-serif;
+color:var(--dim);padding:2px 0}
+.tape-dc{min-width:34px;width:34px;height:28px;padding:1px}
+.tape-we{background:#1a2320}
+.tape-today{outline:2px solid var(--accent);outline-offset:-1px}
+.tape-hl{background:#252515}
+.tape-dn{font-size:11px;font-weight:bold;line-height:1.2}
+.tape-dw{font-size:9px;color:var(--dim);line-height:1}
+.tape-hm{font-size:7px;color:var(--accent);white-space:nowrap;overflow:hidden;
+text-overflow:ellipsis;line-height:1}
+.tape-bar{display:block;height:22px;border-radius:2px;overflow:hidden;white-space:nowrap;
+text-overflow:ellipsis;font:10px/22px Verdana,sans-serif;color:#fff;padding:0 4px;
+text-decoration:none}
+.tape-bar:hover{filter:brightness(1.15)}
 """
 
 # Flatpickr range script with live availability greying (not an f-string to avoid brace escaping)
@@ -269,6 +320,111 @@ def _calc_form_html(props: dict, v: dict, avail: dict, form_action: str,
     )
 
 
+def _render_tape_chart(props, blocks, win_start, win_end, today_date, rules,
+                        cancel_confirm_block=None, admin_key=""):
+    kp = f"&key={admin_key}" if admin_key else ""
+    n_days = (win_end - win_start).days + 1
+    window_days = [win_start + timedelta(days=i) for i in range(n_days)]
+    WD = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
+
+    # Header row
+    header = '<th class="tape-lh"></th>'
+    for d in window_days:
+        hol = holiday_for(d, rules)
+        cls = "tape-dh"
+        if d.weekday() >= 5:
+            cls += " tape-we"
+        if d == today_date:
+            cls += " tape-today"
+        if hol:
+            cls += " tape-hl"
+        ttl = f' title="{html_esc(hol["label"])}"' if hol else ""
+        hm = (f'<div class="tape-hm" title="{html_esc(hol["label"])}">'
+              f'{html_esc(hol["label"][:6])}</div>') if hol else ""
+        header += (
+            f'<th class="{cls}"{ttl}>'
+            f'<div class="tape-dn">{d.day}</div>'
+            f'<div class="tape-dw">{WD[d.weekday()]}</div>'
+            f'{hm}</th>'
+        )
+
+    # Filter active blocks intersecting window
+    active = []
+    for b in blocks:
+        if b.get("status") != "active":
+            continue
+        try:
+            bc, bo = _d(b["checkin"]), _d(b["checkout"])
+        except (KeyError, ValueError):
+            continue
+        if bo > win_start and bc <= win_end:
+            active.append(b)
+
+    # House rows
+    rows_html = ""
+    for house_id, hp in props.items():
+        day_block = {}
+        for b in active:
+            if house_id not in b.get("houses", []):
+                continue
+            bc, bo = _d(b["checkin"]), _d(b["checkout"])
+            cur = max(bc, win_start)
+            last = min(bo - timedelta(days=1), win_end)
+            while cur <= last:
+                day_block[cur] = b
+                cur += timedelta(days=1)
+
+        cells = ""
+        pos = 0
+        while pos < n_days:
+            d = window_days[pos]
+            b = day_block.get(d)
+            cls = "tape-dc"
+            if d.weekday() >= 5:
+                cls += " tape-we"
+            if d == today_date:
+                cls += " tape-today"
+            if holiday_for(d, rules):
+                cls += " tape-hl"
+
+            if b:
+                span = 1
+                while (pos + span < n_days
+                       and day_block.get(window_days[pos + span]) is b):
+                    span += 1
+                color = _block_color(b["sk"])
+                label = b.get("label", "?")
+                cancel_url = f"/admin?tab=block&cancel_confirm={html_esc(b['sk'])}{kp}"
+                data = (
+                    f' data-house="{html_esc(house_id)}"'
+                    f' data-checkin="{html_esc(b["checkin"])}"'
+                    f' data-checkout="{html_esc(b["checkout"])}"'
+                )
+                cells += (
+                    f'<td class="{cls}" colspan="{span}"{data}>'
+                    f'<a class="tape-bar" href="{cancel_url}" '
+                    f'style="background:{color}" title="{html_esc(label)}">'
+                    f'{html_esc(label)}</a></td>'
+                )
+                pos += span
+            else:
+                cells += f'<td class="{cls}"></td>'
+                pos += 1
+
+        rows_html += (
+            f'<tr><td class="tape-lc">{html_esc(hp["name"])}</td>{cells}</tr>'
+        )
+
+    return (
+        f'<div class="tape-wrap">'
+        f'<table class="tape-tbl">'
+        f'<thead><tr>{header}</tr></thead>'
+        f'<tbody>{rows_html}</tbody>'
+        f'</table>'
+        f'</div>'
+    )
+
+
 def render_page(props: dict, params=None, q: Quote = None, error=None,
                 avail=None, block_url=None):
     v = params or {}
@@ -292,7 +448,7 @@ def render_page(props: dict, params=None, q: Quote = None, error=None,
 
 def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
                  tab="block", q=None, price_error=None, price_params=None,
-                 avail=None, block_url=None):
+                 avail=None, block_url=None, month_str="", cancel_confirm_block=None):
     pf = prefill or {}
     kp = f"&key={admin_key}" if admin_key else ""
     key_hidden = f'<input type="hidden" name="key" value="{html_esc(admin_key)}">' if admin_key else ""
@@ -316,23 +472,76 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
         )
         main_content = price_html
     else:
-        today = date.today().isoformat()
-        upcoming = sorted(
-            [b for b in blocks if b.get("status") == "active" and b.get("checkout", "") >= today],
-            key=lambda b: b.get("checkin", ""),
+        # Window computation
+        if month_str:
+            try:
+                month_date = date.fromisoformat(month_str + "-01")
+            except ValueError:
+                month_date = date.today().replace(day=1)
+        else:
+            month_date = date.today().replace(day=1)
+        ny, nm = _next_month_ym(month_date.year, month_date.month)
+        win_start = month_date
+        win_end = _month_end(ny, nm)
+        today_date = date.today()
+
+        # Month navigation header
+        py, pm = _prev_month(month_date.year, month_date.month)
+        ny2, nm2 = _next_month_ym(month_date.year, month_date.month)
+        prev_href = f"/admin?tab=block&month={py}-{pm:02d}{kp}"
+        next_href = f"/admin?tab=block&month={ny2}-{nm2:02d}{kp}"
+        window_label = f'{month_date.strftime("%B %Y")} – {date(ny, nm, 1).strftime("%B %Y")}'
+        month_nav = (
+            f'<div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">'
+            f'<a href="{prev_href}" class="btn-sec" style="padding:4px 12px">← Prev</a>'
+            f'<span style="font:13px Verdana,sans-serif;color:var(--dim)">{window_label}</span>'
+            f'<a href="{next_href}" class="btn-sec" style="padding:4px 12px">Next →</a>'
+            f'</div>'
         )
 
-        blocks_html = ""
+        # Tape chart
+        rules = load_rules()
+        tape_html = _render_tape_chart(
+            props, blocks, win_start, win_end, today_date, rules,
+            cancel_confirm_block=cancel_confirm_block, admin_key=admin_key,
+        )
+
+        # Cancel confirm panel
+        if cancel_confirm_block:
+            b = cancel_confirm_block
+            houses_str = ", ".join(props.get(h, {}).get("name", h) for h in b.get("houses", []))
+            confirm_html = (
+                f'<div class="result" style="border-color:var(--err);margin-bottom:20px">'
+                f'<h2 style="color:var(--err)">Cancel Block?</h2>'
+                f'<p><b>{html_esc(b.get("label","?"))}</b><br>'
+                f'Houses: {html_esc(houses_str)}<br>'
+                f'{html_esc(b.get("checkin",""))} → {html_esc(b.get("checkout",""))}<br>'
+                f'Created by: {html_esc(b.get("created_by",""))}</p>'
+                f'<a href="/admin?tab=block&action=cancel_block&block_id={html_esc(b["sk"])}{kp}" '
+                f'class="btn-sec" style="color:var(--err);border-color:var(--err)">'
+                f'Yes, cancel this block</a>'
+                f'&nbsp;<a href="/admin?tab=block{kp}" class="btn-sec">Never mind</a>'
+                f'</div>'
+            )
+        else:
+            confirm_html = ""
+
+        # Compact upcoming list (secondary, below chart)
+        today_iso = today_date.isoformat()
+        upcoming = sorted(
+            [b for b in blocks if b.get("status") == "active" and b.get("checkout", "") >= today_iso],
+            key=lambda b: b.get("checkin", ""),
+        )
         if upcoming:
             rows = ""
             for b in upcoming:
                 houses_str = ", ".join(props.get(h, {}).get("name", h) for h in b.get("houses", []))
-                cancel_url = f"/admin?tab=block&action=cancel_block&block_id={html_esc(b['sk'])}{kp}"
+                detail_url = f"/admin?tab=block&cancel_confirm={html_esc(b['sk'])}{kp}"
                 rows += (
                     f'<li style="margin-bottom:8px">'
                     f'<b>{html_esc(b.get("label","?"))}</b>: {html_esc(houses_str)}, '
                     f'{html_esc(b.get("checkin",""))} → {html_esc(b.get("checkout",""))}'
-                    f' &nbsp;<a href="{cancel_url}" style="color:var(--err);font-size:12px">[cancel]</a>'
+                    f' &nbsp;<a href="{detail_url}" style="color:var(--dim);font-size:12px">[details/cancel]</a>'
                     f'</li>'
                 )
             blocks_html = f'<ul style="padding-left:20px;margin:8px 0 0">{rows}</ul>'
@@ -361,7 +570,10 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
         label_val = html_esc(pf.get("label", ""))
         back_href = f"/?key={admin_key}" if admin_key else "/"
 
-        block_form = (
+        main_content = (
+            f'{confirm_html}'
+            f'{month_nav}'
+            f'{tape_html}'
             f'{msg_html}'
             f'<form method="get" action="/admin">'
             f'<input type="hidden" name="tab" value="block">'
@@ -384,7 +596,6 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
             f'{blocks_html}'
             f'</div>'
         )
-        main_content = block_form
 
     flatpickr_init = (
         '<script>flatpickr("#admin_dates",{mode:"range",dateFormat:"Y-m-d",minDate:"today",showMonths:2});</script>'
@@ -443,6 +654,7 @@ def lambda_handler(event, context):
 
         tab = qs.get("tab", "block")
         action = qs.get("action", "")
+        month_str = qs.get("month", "")
         msg = ""
         prefill = dict(qs)
 
@@ -522,11 +734,21 @@ def lambda_handler(event, context):
         except Exception:
             blocks = []
 
+        # Resolve cancel_confirm block (block tab only)
+        cancel_confirm_block = None
+        cancel_confirm_id = qs.get("cancel_confirm", "")
+        if cancel_confirm_id and tab == "block":
+            for b in blocks:
+                if b.get("sk") == cancel_confirm_id and b.get("status") == "active":
+                    cancel_confirm_block = b
+                    break
+
         admin_key = ADMIN_SECRET if via_key else ""
         resp = _resp(200, render_admin(
             props, blocks, msg=msg, prefill=prefill, admin_key=admin_key,
             tab=tab, q=q_price, price_error=price_error, price_params=dict(qs),
             avail=price_avail, block_url=price_block_url,
+            month_str=month_str, cancel_confirm_block=cancel_confirm_block,
         ))
         if via_key:
             resp["cookies"] = [_admin_cookie()]
