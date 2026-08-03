@@ -95,10 +95,11 @@ def render_page(props: dict, params=None, q: Quote = None, error=None):
             lines = "\n".join(q.lines)
             abnb = f'<br>List on Airbnb at <b>${q.airbnb_listing_price:,.2f}</b> to net this amount' if q.airbnb_listing_price else ""
             fee = f'<br>Channel/payment fees: ${(q.airbnb_fee + q.cc_fee):,.2f}' if (q.airbnb_fee or q.cc_fee) else ""
-            body = (f'<div class="line">{lines}</div>'
-                    f'<div class="tot">Guest pays: <b>${q.subtotal:,.2f}</b>{abnb}{fee}'
+            body = (f'<div class="tot" style="border-top:0;margin-top:0;padding-top:0">Guest pays: <b>${q.subtotal:,.2f}</b>{abnb}{fee}'
                     f'<br>Gross profit: ${q.gross_profit:,.2f} &nbsp;·&nbsp; '
                     f'<span class="bonus">Anya\'s bonus (20%): ${q.anya_bonus:,.2f}</span></div>'
+                    f'<details style="margin-top:14px"><summary style="cursor:pointer;color:var(--dim);font:12px Verdana">Show reasoning</summary>'
+                    f'<div class="line" style="margin-top:8px">{lines}</div></details>'
                     f'<div style="color:var(--dim);font-size:11px;margin-top:8px;font-family:Verdana">rules: {q.rules_source}</div>')
         result_html = f'<div class="result"><h2>Quote &amp; reasoning</h2>{body}</div>'
     return f"""<!doctype html><html><head><meta charset="utf-8">
@@ -108,7 +109,7 @@ def render_page(props: dict, params=None, q: Quote = None, error=None):
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/flatpickr/4.6.13/themes/dark.min.css">
 <style>{CSS}</style></head><body><div class="wrap">
 <h1>Zubyria <b>Reservation Calculator</b></h1>
-<div class="sub">Three houses · banya · jacuzzi — internal quote tool</div>
+<div class="sub">Three houses · banya · jacuzzi</div>
 <form method="get" action="/">
 <fieldset><legend>Dates</legend><div class="row">
 <label>Stay <input type="text" id="dates" name="dates" placeholder="check-in → check-out" value="{val('dates')}" required style="min-width:240px"></label>
