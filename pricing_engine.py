@@ -196,7 +196,8 @@ class Quote:
     errors: list = field(default_factory=list)
 
 def quote(check_in: date, check_out: date, bookings: dict, jacuzzi_uses: int = 0,
-          pets: int = 0, booking_type: str = "cash", rules: dict = None) -> Quote:
+          pets: int = 0, booking_type: str = "cash", rules: dict = None,
+          event: bool = False, event_guests: int = 0) -> Quote:
     q = Quote()
     if booking_type not in BOOKING_TYPES:
         q.errors.append(f"Unknown booking type: {booking_type}"); return q
@@ -206,6 +207,9 @@ def quote(check_in: date, check_out: date, bookings: dict, jacuzzi_uses: int = 0
     jacuzzi_fee = _num(mods.get("jacuzzi_fee"), 100.0)
     pet_fee = _num(mods.get("pet_fee"), 25.0)
     default_min_stay = int(_num(mods.get("default_min_stay"), 2))
+    event_base = _num(mods.get("event_base"), 500.0)
+    event_per_person = _num(mods.get("event_per_person"), 30.0)
+    event_min_days = int(_num(mods.get("event_min_days"), 1))
 
     nights = (check_out - check_in).days
     if nights <= 0:
@@ -227,6 +231,8 @@ def quote(check_in: date, check_out: date, bookings: dict, jacuzzi_uses: int = 0
         hol = holiday_for(check_in + timedelta(days=i), rules)
         if hol and hol["min_stay"]:
             q.min_stay_required = max(q.min_stay_required, hol["min_stay"])
+    if event:
+        q.min_stay_required = max(q.min_stay_required, event_min_days)
     if nights < q.min_stay_required:
         q.errors.append(f"Minimum stay for these dates is {q.min_stay_required} nights (requested {nights})")
         return q
@@ -255,7 +261,12 @@ def quote(check_in: date, check_out: date, bookings: dict, jacuzzi_uses: int = 0
     if pet_total:
         q.lines.append(f"Pets: {pets} x ${pet_fee:g} per stay = ${pet_total:g}")
 
-    q.rental_price = nightly_total + extra_total + jacuzzi_total + pet_total
+    event_total = 0.0
+    if event:
+        event_total = event_base + event_per_person * event_guests
+        q.lines.append(f"Event: ${event_base:g} base + {event_guests} x ${event_per_person:g} = ${event_total:g}")
+
+    q.rental_price = nightly_total + extra_total + jacuzzi_total + pet_total + event_total
     q.subtotal = q.rental_price + q.cleaning_total
 
     bt = BOOKING_TYPES[booking_type]

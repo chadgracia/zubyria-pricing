@@ -38,13 +38,15 @@ class Store:
             kw["ExclusiveStartKey"] = r["LastEvaluatedKey"]
         return items
 
-    def availability(self, checkin, checkout):
+    def availability(self, checkin, checkout, exclude_id=None):
         """Return {house_id: {"available": False, "blocked_by": label}} for every house
         that has an overlapping active block.  Houses with no overlap are omitted
         (caller treats absence as available=True)."""
         result = {}
         for b in self.list_blocks():
             if b.get("status") != "active":
+                continue
+            if exclude_id and b.get("sk") == exclude_id:
                 continue
             bc, bo = _d(b["checkin"]), _d(b["checkout"])
             if not _overlaps(checkin, checkout, bc, bo):
@@ -54,11 +56,12 @@ class Store:
                     result[h] = {"available": False, "blocked_by": b.get("label", "")}
         return result
 
-    def add_block(self, houses, checkin, checkout, label, created_by="admin"):
-        """Check availability for the given houses; if any conflict, return
-        {"ok": False, "conflicts": [label, ...]} without writing.
+    def add_block(self, houses, checkin, checkout, label, created_by="admin",
+                  exclude_id=None, snapshot=None, quote_params=None, btype=None):
+        """Check availability for the given houses (excluding exclude_id block); if any conflict,
+        return {"ok": False, "conflicts": [label, ...]} without writing.
         On success write the item and return {"ok": True, "id": sk}."""
-        avail = self.availability(checkin, checkout)
+        avail = self.availability(checkin, checkout, exclude_id=exclude_id)
         conflicts = [
             avail[h]["blocked_by"]
             for h in houses
@@ -67,7 +70,7 @@ class Store:
         if conflicts:
             return {"ok": False, "conflicts": conflicts}
         sk = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%S%f") + "_" + uuid.uuid4().hex[:8]
-        self._t.put_item(Item={
+        item = {
             "pk": "BLOCK", "sk": sk,
             "houses": houses,
             "checkin": checkin.isoformat() if hasattr(checkin, "isoformat") else checkin,
@@ -76,7 +79,14 @@ class Store:
             "status": "active",
             "created_at": datetime.datetime.utcnow().isoformat(),
             "created_by": created_by,
-        })
+        }
+        if snapshot:
+            item["snapshot"] = snapshot
+        if quote_params:
+            item["quote_params"] = quote_params
+        if btype:
+            item["btype"] = btype
+        self._t.put_item(Item=item)
         return {"ok": True, "id": sk}
 
     def cancel_block(self, block_id):

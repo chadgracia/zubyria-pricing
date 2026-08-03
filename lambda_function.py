@@ -6,6 +6,7 @@ GET  /admin              -> Admin page (requires ?key= or zadmin cookie)
 GET  /availability.json  -> Public availability dict (blocked_by stripped for non-admin)
 """
 import json
+import urllib.parse
 from datetime import date, timedelta
 from pricing_engine import quote, load_rules, Quote, holiday_for
 
@@ -208,7 +209,10 @@ def parse_params(qs: dict, props: dict):
     jacuzzi = int(p.get("jacuzzi", 0) or 0)
     pets = int(p.get("pets", 0) or 0)
     btype = p.get("btype", "cash")
-    return checkin, checkout, bookings, jacuzzi, pets, btype
+    ev_raw = p.get("event", "")
+    event_use = ev_raw in ("on", "1", "true")
+    event_guests = int(p.get("event_guests", 0) or 0)
+    return checkin, checkout, bookings, jacuzzi, pets, btype, event_use, event_guests
 
 
 def quote_to_dict(q: Quote):
@@ -307,6 +311,9 @@ def _calc_form_html(props: dict, v: dict, avail: dict, form_action: str,
         f'<fieldset><legend>Extras &amp; channel</legend><div class="row">'
         f'<label>Jacuzzi uses <input type="number" name="jacuzzi" min="0" value="{val("jacuzzi","0")}"></label>'
         f'<label>Pets <input type="number" name="pets" min="0" value="{val("pets","0")}"></label>'
+        f'<label>Event <input type="checkbox" name="event" id="event"'
+        f'{"  checked" if v.get("event") in ("on","1","true") else ""}></label>'
+        f'<label>Event guests <input type="number" name="event_guests" min="0" value="{val("event_guests","0")}"></label>'
         f'<label>Booking type <select name="btype">'
         f'<option value="cash" {sel("btype","cash","cash")}>Cash (0%)</option>'
         f'<option value="airbnb" {sel("btype","airbnb")}>Airbnb (15.5%)</option>'
@@ -455,10 +462,12 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
 
     tab_block_href = f"/admin?tab=block{kp}"
     tab_price_href = f"/admin?tab=price{kp}"
+    tab_bonus_href = f"/admin?tab=bonus{kp}"
     tab_nav = (
         f'<nav class="tab-nav">'
         f'<a href="{tab_block_href}" class="{"active" if tab == "block" else ""}">Block</a>'
         f'<a href="{tab_price_href}" class="{"active" if tab == "price" else ""}">Price</a>'
+        f'<a href="{tab_bonus_href}" class="{"active" if tab == "bonus" else ""}">Bonus</a>'
         f'</nav>'
     )
 
@@ -471,8 +480,94 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
             show_internal=True, reset_href=reset_href,
         )
         main_content = price_html
+
+    elif tab == "bonus":
+        # Parse month
+        if month_str:
+            try:
+                bonus_month_date = date.fromisoformat(month_str + "-01")
+            except ValueError:
+                bonus_month_date = date.today().replace(day=1)
+        else:
+            bonus_month_date = date.today().replace(day=1)
+        bm_y, bm_m = bonus_month_date.year, bonus_month_date.month
+        month_end_day = _month_end(bm_y, bm_m)
+
+        py_b, pm_b = _prev_month(bm_y, bm_m)
+        ny_b, nm_b = _next_month_ym(bm_y, bm_m)
+        month_label_b = bonus_month_date.strftime("%B %Y")
+        bonus_month_nav = (
+            f'<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">'
+            f'<a href="/admin?tab=bonus&month={py_b}-{pm_b:02d}{kp}" class="btn-sec" style="padding:4px 12px">← Prev</a>'
+            f'<span style="font:13px Verdana,sans-serif;color:var(--dim)">{html_esc(month_label_b)}</span>'
+            f'<a href="/admin?tab=bonus&month={ny_b}-{nm_b:02d}{kp}" class="btn-sec" style="padding:4px 12px">Next →</a>'
+            f'</div>'
+        )
+
+        month_start_iso = bonus_month_date.isoformat()
+        month_end_iso = month_end_day.isoformat()
+        month_blocks = [
+            b for b in blocks
+            if b.get("status") == "active"
+            and month_start_iso <= b.get("checkin", "") <= month_end_iso
+        ]
+        priced = [b for b in month_blocks if b.get("snapshot")]
+        unpriced = [b for b in month_blocks if not b.get("snapshot")]
+        total_bonus = sum(b["snapshot"].get("bonus", 0) for b in priced)
+
+        if priced:
+            tbl_s = 'style="border-collapse:collapse;width:100%;font:13px Verdana,sans-serif"'
+            th_s = 'style="text-align:left;padding:8px 12px;border-bottom:1px solid #333c36;color:var(--dim);font-size:11px;letter-spacing:.1em;text-transform:uppercase"'
+            rows_b = ""
+            for b in priced:
+                hs = ", ".join(props.get(h, {}).get("name", h) for h in b.get("houses", []))
+                snap = b["snapshot"]
+                rows_b += (
+                    f'<tr>'
+                    f'<td style="padding:8px 12px;border-bottom:1px solid #2a322d">{html_esc(b.get("label","?"))}</td>'
+                    f'<td style="padding:8px 12px;border-bottom:1px solid #2a322d">{html_esc(b.get("checkin",""))} → {html_esc(b.get("checkout",""))}</td>'
+                    f'<td style="padding:8px 12px;border-bottom:1px solid #2a322d">{html_esc(hs)}</td>'
+                    f'<td style="padding:8px 12px;border-bottom:1px solid #2a322d">{html_esc(b.get("btype","—"))}</td>'
+                    f'<td style="padding:8px 12px;border-bottom:1px solid #2a322d">${snap.get("subtotal",0):,.2f}</td>'
+                    f'<td class="bonus" style="padding:8px 12px;border-bottom:1px solid #2a322d">${snap.get("bonus",0):,.2f}</td>'
+                    f'</tr>'
+                )
+            priced_html = (
+                f'<div style="overflow-x:auto"><table {tbl_s}>'
+                f'<thead><tr>'
+                f'<th {th_s}>Label</th><th {th_s}>Dates</th><th {th_s}>Houses</th>'
+                f'<th {th_s}>Type</th><th {th_s}>Guest pays</th><th {th_s}>Anya\'s bonus</th>'
+                f'</tr></thead><tbody>{rows_b}</tbody>'
+                f'<tfoot><tr>'
+                f'<td colspan="5" style="padding:10px 12px;font-weight:bold">Total bonus</td>'
+                f'<td class="bonus" style="padding:10px 12px;font-weight:bold">${total_bonus:,.2f}</td>'
+                f'</tr></tfoot></table></div>'
+            )
+        else:
+            priced_html = f'<p style="color:var(--dim)">No priced blocks in {html_esc(month_label_b)}.</p>'
+
+        if unpriced:
+            up_items = "".join(
+                f'<li>{html_esc(b.get("label","?"))}: {html_esc(b.get("checkin",""))} → {html_esc(b.get("checkout",""))}</li>'
+                for b in unpriced
+            )
+            unpriced_html = (
+                f'<div style="margin-top:20px">'
+                f'<h2 style="font:13px Verdana,sans-serif;text-transform:uppercase;letter-spacing:.1em;color:var(--dim);margin-bottom:8px">Unpriced blocks (no snapshot)</h2>'
+                f'<ul style="padding-left:20px;margin:0;font-size:13px">{up_items}</ul>'
+                f'</div>'
+            )
+        else:
+            unpriced_html = ""
+
+        main_content = (
+            f'<h2 style="font:16px Verdana,sans-serif;margin:0 0 16px">Anya\'s Bonus — {html_esc(month_label_b)}</h2>'
+            f'{bonus_month_nav}'
+            f'<div class="result">{priced_html}{unpriced_html}</div>'
+        )
+
     else:
-        # Window computation
+        # BLOCK tab
         if month_str:
             try:
                 month_date = date.fromisoformat(month_str + "-01")
@@ -485,7 +580,6 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
         win_end = _month_end(ny, nm)
         today_date = date.today()
 
-        # Month navigation header
         py, pm = _prev_month(month_date.year, month_date.month)
         ny2, nm2 = _next_month_ym(month_date.year, month_date.month)
         prev_href = f"/admin?tab=block&month={py}-{pm:02d}{kp}"
@@ -499,17 +593,41 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
             f'</div>'
         )
 
-        # Tape chart
         rules = load_rules()
         tape_html = _render_tape_chart(
             props, blocks, win_start, win_end, today_date, rules,
             cancel_confirm_block=cancel_confirm_block, admin_key=admin_key,
         )
 
-        # Cancel confirm panel
+        # Cancel confirm panel — includes Edit link
         if cancel_confirm_block:
             b = cancel_confirm_block
             houses_str = ", ".join(props.get(h, {}).get("name", h) for h in b.get("houses", []))
+            # Build Edit URL
+            edit_parts = [
+                f"tab=block",
+                f"edit_id={urllib.parse.quote(b['sk'], safe='')}",
+                f"dates={urllib.parse.quote(b['checkin'] + ' to ' + b['checkout'], safe='')}",
+            ]
+            for h in b.get("houses", []):
+                edit_parts.append(f"h_{h}=on")
+            edit_parts.append(f"label={urllib.parse.quote(b.get('label', ''), safe='')}")
+            if b.get("btype"):
+                edit_parts.append(f"btype={urllib.parse.quote(b['btype'], safe='')}")
+                qp = b.get("quote_params") or {}
+                for h2 in props:
+                    if isinstance(qp.get("houses"), dict) and h2 in qp["houses"]:
+                        edit_parts.append(f"g_{h2}={qp['houses'][h2]}")
+                if qp.get("jacuzzi"):
+                    edit_parts.append(f"jacuzzi={qp['jacuzzi']}")
+                if qp.get("pets"):
+                    edit_parts.append(f"pets={qp['pets']}")
+                if qp.get("event"):
+                    edit_parts.append("event=on")
+                    edit_parts.append(f"event_guests={qp.get('event_guests', 0)}")
+            if admin_key:
+                edit_parts.append(f"key={urllib.parse.quote(admin_key, safe='')}")
+            edit_url = "/admin?" + "&".join(edit_parts)
             confirm_html = (
                 f'<div class="result" style="border-color:var(--err);margin-bottom:20px">'
                 f'<h2 style="color:var(--err)">Cancel Block?</h2>'
@@ -517,7 +635,8 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
                 f'Houses: {html_esc(houses_str)}<br>'
                 f'{html_esc(b.get("checkin",""))} → {html_esc(b.get("checkout",""))}<br>'
                 f'Created by: {html_esc(b.get("created_by",""))}</p>'
-                f'<a href="/admin?tab=block&action=cancel_block&block_id={html_esc(b["sk"])}{kp}" '
+                f'<a href="{html_esc(edit_url)}" class="btn-sec" style="margin-right:8px">Edit this block</a>'
+                f'<a href="/admin?tab=block&action=cancel_block&block_id={urllib.parse.quote(b["sk"], safe="")}{kp}" '
                 f'class="btn-sec" style="color:var(--err);border-color:var(--err)">'
                 f'Yes, cancel this block</a>'
                 f'&nbsp;<a href="/admin?tab=block{kp}" class="btn-sec">Never mind</a>'
@@ -526,7 +645,6 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
         else:
             confirm_html = ""
 
-        # Compact upcoming list (secondary, below chart)
         today_iso = today_date.isoformat()
         upcoming = sorted(
             [b for b in blocks if b.get("status") == "active" and b.get("checkout", "") >= today_iso],
@@ -536,7 +654,7 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
             rows = ""
             for b in upcoming:
                 houses_str = ", ".join(props.get(h, {}).get("name", h) for h in b.get("houses", []))
-                detail_url = f"/admin?tab=block&cancel_confirm={html_esc(b['sk'])}{kp}"
+                detail_url = f"/admin?tab=block&cancel_confirm={urllib.parse.quote(b['sk'], safe='')}{kp}"
                 rows += (
                     f'<li style="margin-bottom:8px">'
                     f'<b>{html_esc(b.get("label","?"))}</b>: {html_esc(houses_str)}, '
@@ -548,13 +666,48 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
         else:
             blocks_html = '<p style="color:var(--dim);margin:8px 0 0">No upcoming blocks.</p>'
 
+        # House checkboxes — support prefill for edit / "Block these dates" flow
         house_checks = ""
-        for h, p in props.items():
+        for h, hp in props.items():
+            h_checked = " checked" if pf.get(f"h_{h}") == "on" else ""
             house_checks += (
                 f'<label style="margin-right:16px">'
-                f'<input type="checkbox" name="h_{h}"> {html_esc(p["name"])}'
+                f'<input type="checkbox" name="h_{h}"{h_checked}> {html_esc(hp["name"])}'
                 f'</label>'
             )
+
+        # Pricing expander (optional snapshot capture)
+        guest_inputs = ""
+        for h, hp in props.items():
+            gv = html_esc(pf.get(f"g_{h}", str(hp["base_cap"])))
+            guest_inputs += (
+                f'<label style="margin-right:12px">{html_esc(hp["name"])} guests '
+                f'<input type="number" name="g_{h}" min="1" max="{hp["max_guests"]}" value="{gv}" style="width:50px">'
+                f'</label>'
+            )
+        has_btype = bool(pf.get("btype"))
+        popen = " open" if has_btype else ""
+        btype_opts = ""
+        for bt_id, bt_lbl in [("", "No pricing"), ("cash", "Cash"), ("airbnb", "Airbnb (15.5%)"),
+                                ("monobank", "Site — UA card (1.3%)"), ("stripe", "Site — Int'l card (5.5%)")]:
+            sel_a = " selected" if pf.get("btype", "") == bt_id else ""
+            btype_opts += f'<option value="{bt_id}"{sel_a}>{bt_lbl}</option>'
+        ev_chk = " checked" if pf.get("event") in ("on", "1", "true") else ""
+        pricing_expander = (
+            f'<details{popen} style="margin-top:12px">'
+            f'<summary style="cursor:pointer;color:var(--dim);font:12px Verdana">Pricing (optional — for bonus tracking)</summary>'
+            f'<div style="margin-top:10px">'
+            f'<div class="row" style="margin-bottom:10px">'
+            f'<label>Booking type <select name="btype">{btype_opts}</select></label>'
+            f'</div>'
+            f'<div class="row" style="margin-bottom:10px">{guest_inputs}</div>'
+            f'<div class="row">'
+            f'<label>Jacuzzi uses <input type="number" name="jacuzzi" min="0" value="{html_esc(pf.get("jacuzzi","0"))}" style="width:60px"></label>'
+            f'<label>Pets <input type="number" name="pets" min="0" value="{html_esc(pf.get("pets","0"))}" style="width:60px"></label>'
+            f'<label>Event <input type="checkbox" name="event"{ev_chk}></label>'
+            f'<label>Event guests <input type="number" name="event_guests" min="0" value="{html_esc(pf.get("event_guests","0"))}" style="width:60px"></label>'
+            f'</div></div></details>'
+        )
 
         if msg:
             ok = msg.lower().startswith("block") and "conflict" not in msg.lower()
@@ -566,6 +719,9 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
         else:
             msg_html = ""
 
+        edit_id = pf.get("edit_id", "")
+        edit_hidden = f'<input type="hidden" name="edit_id" value="{html_esc(edit_id)}">' if edit_id else ""
+        block_btn = "Update block" if edit_id else "Block dates"
         dates_val = html_esc(pf.get("dates", ""))
         label_val = html_esc(pf.get("label", ""))
         back_href = f"/?key={admin_key}" if admin_key else "/"
@@ -579,7 +735,8 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
             f'<input type="hidden" name="tab" value="block">'
             f'<input type="hidden" name="action" value="add_block">'
             f'{key_hidden}'
-            f'<fieldset><legend>Block dates</legend><div class="row">'
+            f'{edit_hidden}'
+            f'<fieldset><legend>{"Edit block" if edit_id else "Block dates"}</legend><div class="row">'
             f'<label>Stay <input type="text" id="admin_dates" name="dates" '
             f'placeholder="check-in → check-out" value="{dates_val}" required style="min-width:240px">'
             f'</label></div></fieldset>'
@@ -587,8 +744,8 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
             f'<fieldset><legend>Guest / reason</legend>'
             f'<input type="text" name="label" value="{label_val}" '
             f'placeholder="Guest name or reason" required style="min-width:260px">'
-            f'</fieldset>'
-            f'<button type="submit">Block dates</button>'
+            f'{pricing_expander}</fieldset>'
+            f'<button type="submit">{block_btn}</button>'
             f'<a href="{html_esc(back_href)}" class="btn-sec" style="margin-left:10px">← Calculator</a>'
             f'</form>'
             f'<div class="result" style="margin-top:26px">'
@@ -597,11 +754,12 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
             f'</div>'
         )
 
-    flatpickr_init = (
-        '<script>flatpickr("#admin_dates",{mode:"range",dateFormat:"Y-m-d",minDate:"today",showMonths:2});</script>'
-        if tab == "block" else
-        f'<script>{AVAIL_JS}</script>'
-    )
+    if tab == "block":
+        flatpickr_init = '<script>flatpickr("#admin_dates",{mode:"range",dateFormat:"Y-m-d",minDate:"today",showMonths:2});</script>'
+    elif tab == "price":
+        flatpickr_init = f'<script>{AVAIL_JS}</script>'
+    else:
+        flatpickr_init = ""
 
     return (
         f'<!doctype html><html><head><meta charset="utf-8">'
@@ -660,6 +818,7 @@ def lambda_handler(event, context):
 
         # Block actions (only relevant in block tab)
         if action == "add_block":
+            edit_id = qs.get("edit_id", "").strip()
             dates_str = qs.get("dates", "")
             houses = [h for h in props if qs.get(f"h_{h}") == "on"]
             label = qs.get("label", "").strip()
@@ -674,9 +833,51 @@ def lambda_handler(event, context):
                     raise ValueError("Select at least one house")
                 ci = date.fromisoformat(parts[0])
                 co = date.fromisoformat(parts[1])
-                r = _get_store().add_block(houses, ci, co, label, created_by="admin")
+                # Snapshot computation if btype provided
+                snapshot = None
+                quote_params_out = None
+                snap_btype = qs.get("btype", "").strip()
+                if snap_btype and snap_btype in ("cash", "airbnb", "monobank", "stripe"):
+                    try:
+                        snap_bookings = {h: int(qs.get(f"g_{h}", props[h]["base_cap"])) for h in houses}
+                        snap_jac = int(qs.get("jacuzzi", 0) or 0)
+                        snap_pets = int(qs.get("pets", 0) or 0)
+                        snap_event = qs.get("event") in ("on", "1", "true")
+                        snap_event_guests = int(qs.get("event_guests", 0) or 0)
+                        snap_q = quote(ci, co, snap_bookings,
+                                       jacuzzi_uses=snap_jac, pets=snap_pets,
+                                       booking_type=snap_btype,
+                                       event=snap_event, event_guests=snap_event_guests)
+                        if not snap_q.errors:
+                            snapshot = {
+                                "subtotal": snap_q.subtotal,
+                                "gross_profit": snap_q.gross_profit,
+                                "bonus": snap_q.anya_bonus,
+                            }
+                            quote_params_out = {
+                                "houses": snap_bookings,
+                                "jacuzzi": snap_jac,
+                                "pets": snap_pets,
+                                "btype": snap_btype,
+                                "event": snap_event,
+                                "event_guests": snap_event_guests,
+                            }
+                    except Exception:
+                        pass
+                r = _get_store().add_block(
+                    houses, ci, co, label,
+                    created_by=f"edited from {edit_id}" if edit_id else "admin",
+                    exclude_id=edit_id or None,
+                    snapshot=snapshot,
+                    quote_params=quote_params_out,
+                    btype=snap_btype or None,
+                )
                 if r["ok"]:
-                    msg = f"Block added: {label} ({parts[0]} → {parts[1]})"
+                    if edit_id:
+                        _get_store().cancel_block(edit_id)
+                        msg = f"Block updated: {label} ({parts[0]} → {parts[1]})"
+                    else:
+                        msg = f"Block added: {label} ({parts[0]} → {parts[1]})"
                     prefill = {}
                 else:
                     conflicts = ", ".join(r["conflicts"])
@@ -705,7 +906,7 @@ def lambda_handler(event, context):
 
         if tab == "price" and (qs.get("dates") or qs.get("checkin")):
             try:
-                price_checkin, price_checkout, price_bookings, jacuzzi, pets, btype = parse_params(qs, props)
+                price_checkin, price_checkout, price_bookings, jacuzzi, pets, btype, price_event_use, price_event_guests = parse_params(qs, props)
                 try:
                     price_avail = _get_store().availability(price_checkin, price_checkout)
                 except Exception:
@@ -718,16 +919,24 @@ def lambda_handler(event, context):
                     price_error = "Check your inputs: Select at least one house"
                 else:
                     q_price = quote(price_checkin, price_checkout, price_bookings,
-                                    jacuzzi_uses=jacuzzi, pets=pets, booking_type=btype)
+                                    jacuzzi_uses=jacuzzi, pets=pets, booking_type=btype,
+                                    event=price_event_use, event_guests=price_event_guests)
             except (ValueError, KeyError) as e:
                 price_error = f"Check your inputs: {e}"
 
-            # "Block these dates" link → pre-fills the BLOCK tab
+            # "Block these dates" link → pre-fills the BLOCK tab with full pricing params
             if q_price and not q_price.errors and price_checkin and price_checkout:
                 houses_qs = "&".join(f"h_{h}=on" for h in price_bookings)
+                guests_qs = "&".join(f"g_{h}={price_bookings[h]}" for h in price_bookings)
                 date_str = qs.get("dates", f"{price_checkin.isoformat()} to {price_checkout.isoformat()}")
-                kp = f"&key={ADMIN_SECRET}" if via_key else ""
-                price_block_url = f"/admin?tab=block&dates={date_str}&{houses_qs}{kp}"
+                kp_link = f"&key={ADMIN_SECRET}" if via_key else ""
+                event_part = f"&event=on&event_guests={price_event_guests}" if price_event_use else ""
+                price_block_url = (
+                    f"/admin?tab=block&dates={urllib.parse.quote(date_str, safe='')}"
+                    f"&{houses_qs}&{guests_qs}"
+                    f"&btype={btype}&jacuzzi={jacuzzi}&pets={pets}"
+                    f"{event_part}{kp_link}"
+                )
 
         try:
             blocks = _get_store().list_blocks()
@@ -786,7 +995,7 @@ def lambda_handler(event, context):
     checkin = checkout = None
     bookings = {}
     try:
-        checkin, checkout, bookings, jacuzzi, pets, btype = parse_params(qs, props)
+        checkin, checkout, bookings, jacuzzi, pets, btype, event_use, event_guests = parse_params(qs, props)
 
         # Availability (best-effort; don't break pricing if DynamoDB is down)
         try:
@@ -806,7 +1015,8 @@ def lambda_handler(event, context):
                 return _resp(400, {"error": err}, json_=True)
             return _resp(200, render_page(props, qs, error=f"Check your inputs: {err}", avail=avail))
 
-        q = quote(checkin, checkout, bookings, jacuzzi_uses=jacuzzi, pets=pets, booking_type=btype)
+        q = quote(checkin, checkout, bookings, jacuzzi_uses=jacuzzi, pets=pets, booking_type=btype,
+                  event=event_use, event_guests=event_guests)
 
     except (ValueError, KeyError) as e:
         if wants_json:
