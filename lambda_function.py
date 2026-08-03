@@ -10,6 +10,11 @@ from pricing_engine import quote, load_rules, Quote
 
 def parse_params(qs: dict, props: dict):
     p = {k: v for k, v in (qs or {}).items()}
+    if p.get("dates") and not p.get("checkin"):
+        parts = [s.strip() for s in p["dates"].replace(" to ", "|").replace(" — ", "|").split("|")]
+        if len(parts) != 2:
+            raise ValueError("Select both check-in and check-out dates on the calendar")
+        p["checkin"], p["checkout"] = parts
     checkin = date.fromisoformat(p["checkin"])
     checkout = date.fromisoformat(p["checkout"])
     bookings = {}
@@ -49,7 +54,10 @@ input[type=text],select,input[type=number]{background:var(--bg);color:var(--ink)
 border-radius:4px;padding:7px 9px;font:14px Verdana,sans-serif}
 input[type=number]{width:70px}
 .row{display:flex;flex-wrap:wrap;gap:14px;align-items:center}
-.house{display:flex;align-items:center;gap:8px;background:var(--bg);border:1px solid #3d4741;border-radius:4px;padding:8px 12px}
+.house{display:flex;flex-direction:column;gap:8px;background:var(--bg);border:1px solid #3d4741;border-radius:6px;padding:10px;width:190px}
+.house img{width:100%;height:100px;object-fit:cover;border-radius:4px}
+.nophoto{width:100%;height:100px;border-radius:4px;background:#333c36;display:flex;align-items:center;justify-content:center;font-size:34px;color:var(--dim)}
+.houserow{display:flex;align-items:center;gap:8px}
 button{background:var(--accent);color:#221c10;border:0;border-radius:4px;padding:10px 26px;
 font:bold 14px Verdana,sans-serif;letter-spacing:.06em;cursor:pointer}
 button:hover{filter:brightness(1.1)}
@@ -73,9 +81,10 @@ def render_page(props: dict, params=None, q: Quote = None, error=None):
         p = props[h]
         opts = "".join(f'<option {"selected" if str(g)==val("g_"+h, str(p["base_cap"])) else ""}>{g}</option>'
                        for g in range(1, p["max_guests"] + 1))
-        house_rows += f'''<div class="house"><input type="checkbox" name="h_{h}" id="h_{h}" {chk("h_"+h)}>
+        photo = f'<img src="{p["photo"]}" alt="{p["name"]}" loading="lazy">' if p.get("photo") else '<div class="nophoto">{}</div>'.format(p["name"][0])
+        house_rows += f'''<div class="house">{photo}<div class="houserow"><input type="checkbox" name="h_{h}" id="h_{h}" {chk("h_"+h)}>
         <label for="h_{h}" style="margin:0">{p["name"]}</label>
-        <select name="g_{h}" title="guests">{opts}</select><span style="color:var(--dim);font-size:12px">guests</span></div>'''
+        <select name="g_{h}" title="guests">{opts}</select><span style="color:var(--dim);font-size:12px">guests</span></div></div>'''
     result_html = ""
     if error:
         result_html = f'<div class="result"><p class="err">{error}</p></div>'
@@ -94,16 +103,15 @@ def render_page(props: dict, params=None, q: Quote = None, error=None):
         result_html = f'<div class="result"><h2>Quote &amp; reasoning</h2>{body}</div>'
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Zubyria — pricing</title>
+<title>Zubyria Reservation Calculator</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/flatpickr/4.6.13/flatpickr.min.css">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/flatpickr/4.6.13/themes/dark.min.css">
 <style>{CSS}</style></head><body><div class="wrap">
-<h1>Zubyria <b>pricing</b></h1>
+<h1>Zubyria <b>Reservation Calculator</b></h1>
 <div class="sub">Three houses · banya · jacuzzi — internal quote tool</div>
 <form method="get" action="/">
 <fieldset><legend>Dates</legend><div class="row">
-<label>Check-in <input type="text" id="checkin" name="checkin" placeholder="select date" value="{val('checkin')}" required></label>
-<label>Check-out <input type="text" id="checkout" name="checkout" placeholder="select date" value="{val('checkout')}" required></label>
+<label>Stay <input type="text" id="dates" name="dates" placeholder="check-in → check-out" value="{val('dates')}" required style="min-width:240px"></label>
 </div></fieldset>
 <fieldset><legend>Houses &amp; guests</legend><div class="row">{house_rows}</div></fieldset>
 <fieldset><legend>Extras &amp; channel</legend><div class="row">
@@ -119,9 +127,7 @@ def render_page(props: dict, params=None, q: Quote = None, error=None):
 </form>{result_html}</div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/flatpickr/4.6.13/flatpickr.min.js"></script>
 <script>
-var co = flatpickr('#checkout', {{dateFormat:'Y-m-d', minDate:'today'}});
-flatpickr('#checkin', {{dateFormat:'Y-m-d', minDate:'today',
-  onChange: function(sel){{ if(sel[0]){{ var d=new Date(sel[0]); d.setDate(d.getDate()+1); co.set('minDate', d); }} }} }});
+flatpickr('#dates', {{mode:'range', dateFormat:'Y-m-d', minDate:'today', showMonths:2}});
 </script></body></html>"""
 
 def lambda_handler(event, context):
@@ -129,7 +135,7 @@ def lambda_handler(event, context):
     qs = event.get("queryStringParameters") or {}
     props = load_rules()["properties"]
     wants_json = path.rstrip("/").endswith("quote.json")
-    if not qs.get("checkin"):
+    if not (qs.get("checkin") or qs.get("dates")):
         if wants_json:
             return _resp(400, {"error": "checkin, checkout required; h_<house>=on, g_<house>, jacuzzi, pets, btype"}, json_=True)
         return _resp(200, render_page(props))

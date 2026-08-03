@@ -103,6 +103,7 @@ def parse_rules_csv(text: str) -> dict:
                     max_guests=int(_num(d.get("MaxGuests"), 0)),
                     cleaning=_num(d.get("CleaningFee"), 0),
                     max_stay=int(_num(d.get("MaxStay"), 365)),
+                    photo=d.get("PhotoURL", "").strip(),
                 )
         elif section and section.startswith("HOLIDAY"):
             if first == "StartDate":
