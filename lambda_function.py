@@ -22,6 +22,10 @@ _BLOCK_COLORS = ["#4e7a5b", "#4a6080", "#7a5a4a", "#6a4f80", "#3d7070"]
 # computed off it, so the two cannot drift apart.
 _TAPE_CELL_W = 34
 
+# Diagonal slant width in px for the check-in / check-out bar edges. Fixed px, never a
+# percentage — a percentage slant eats a short bar's whole body.
+_TAPE_SLANT = 9
+
 
 def _d(s):
     return date.fromisoformat(s)
@@ -131,9 +135,9 @@ border:1px solid transparent;border-bottom:0;margin-bottom:-1px;border-radius:4p
 .tape-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 0 20px}
 .tape-tbl{border-collapse:collapse;table-layout:fixed}
 .tape-tbl th,.tape-tbl td{padding:0;border:1px solid #2a322d;vertical-align:middle}
-.tape-lh{width:80px;min-width:80px;position:sticky;left:0;z-index:2;background:var(--panel);
+.tape-lh{width:80px;min-width:80px;position:sticky;left:0;z-index:6;background:var(--panel);
 font:11px Verdana,sans-serif;color:var(--dim);padding:4px 6px;text-align:left}
-.tape-lc{width:80px;min-width:80px;position:sticky;left:0;z-index:1;background:var(--bg);
+.tape-lc{width:80px;min-width:80px;position:sticky;left:0;z-index:5;background:var(--bg);
 font:12px Verdana,sans-serif;color:var(--ink);padding:4px 6px;white-space:nowrap;
 overflow:hidden;text-overflow:ellipsis}
 .tape-dh{min-width:34px;width:34px;text-align:center;font:10px Verdana,sans-serif;
@@ -146,18 +150,24 @@ color:var(--dim);padding:2px 0}
 .tape-dw{font-size:9px;color:var(--dim);line-height:1}
 .tape-hm{font-size:7px;color:var(--accent);white-space:nowrap;overflow:hidden;
 text-overflow:ellipsis;line-height:1}
-/* Bars are absolutely positioned so their label can never widen a day column.
-   Geometry: left:50% of the check-in cell → width = nights * 34px, landing on the
-   midpoint of the check-out cell. Diagonal edges via clip-path (checkout 10:00,
-   check-in 16:00); the 7px lean makes a departing and an arriving bar meet in the
-   same cell with a clean parallel gap instead of touching. */
+/* ONE absolutely-positioned bar per block per house lane — never per-cell fragments,
+   so a label can never widen a day column. Geometry (checkout 10:00, check-in 16:00):
+   left = 0.5 * cell width into the check-in cell, width = nights * cell width, which
+   lands the right edge on the check-out cell's midpoint.
+
+   z-index:2 is load-bearing. Day cells are position:relative with z-index:auto, so a
+   later cell that carries a background (.tape-we / .tape-hl) would otherwise paint
+   over a bar overflowing from an earlier cell — which truncated bars at a cell edge
+   and swallowed the trailing diagonal. Bars must sit above the whole cell layer, and
+   the sticky label column above them again (z-index 5/6).
+
+   clip-path is emitted inline per bar: the slant is a fixed px width (never a
+   percentage — percentages collapse short bars) and is clamped on narrow bars so the
+   unclipped body stays visible down to a single night. */
 .tape-bar{position:absolute;top:3px;height:22px;border-radius:2px;overflow:hidden;
 white-space:nowrap;text-overflow:ellipsis;font:10px/22px Verdana,sans-serif;color:#fff;
-padding:0 9px;text-decoration:none;box-sizing:border-box;z-index:0}
+padding:0 9px;text-decoration:none;box-sizing:border-box;z-index:2}
 .tape-bar:hover{filter:brightness(1.15)}
-.tape-slant-both{clip-path:polygon(7px 0,100% 0,calc(100% - 7px) 100%,0 100%)}
-.tape-slant-start{clip-path:polygon(7px 0,100% 0,100% 100%,0 100%)}
-.tape-slant-end{clip-path:polygon(0 0,100% 0,calc(100% - 7px) 100%,0 100%)}
 .tape-bar-nolabel{font-size:0;padding:0}
 """
 
@@ -408,23 +418,35 @@ def _render_tape_chart(props, blocks, win_start, win_end, today_date, rules,
             if not (win_start <= anchor <= win_end):
                 continue
 
-            # Flat edge at a clipped window boundary, otherwise a mid-cell diagonal.
+            # Half-cell shift at the check-in edge; flat at a clipped window boundary.
+            # left is (checkin_col_index + 0.5) * cell width, expressed relative to the
+            # anchor cell that hosts the bar, so it never rounds to a whole cell.
             left_off = 0 if clipped_start else _TAPE_CELL_W // 2
             if clipped_end:
                 right_off = (win_end - anchor).days * _TAPE_CELL_W + _TAPE_CELL_W
             else:
+                # nights * cell width lands the right edge on the checkout cell midpoint
                 right_off = (bo - anchor).days * _TAPE_CELL_W + _TAPE_CELL_W // 2
             width = right_off - left_off
             if width <= 0:
                 continue
 
+            # Fixed-px slant, clamped on short bars so the body never collapses.
+            slant_px = min(_TAPE_SLANT, max(4, width // 4))
             if clipped_start and clipped_end:
+                clip = ""            # flat at both window edges
                 slant = ""
             elif clipped_start:
+                clip = (f"clip-path:polygon(0 0,100% 0,"
+                        f"calc(100% - {slant_px}px) 100%,0 100%);")
                 slant = " tape-slant-end"
             elif clipped_end:
+                clip = (f"clip-path:polygon({slant_px}px 0,100% 0,"
+                        f"100% 100%,0 100%);")
                 slant = " tape-slant-start"
             else:
+                clip = (f"clip-path:polygon({slant_px}px 0,100% 0,"
+                        f"calc(100% - {slant_px}px) 100%,0 100%);")
                 slant = " tape-slant-both"
 
             edge = ("" if clipped_start else " tape-half-start") + \
@@ -439,7 +461,7 @@ def _render_tape_chart(props, blocks, win_start, win_end, today_date, rules,
                 f'{" tape-bar-nolabel" if nolabel else ""}"'
                 f' href="{detail_url}"'
                 f' style="background:{_block_color(b["sk"])};'
-                f'left:{left_off}px;width:{width}px"'
+                f'left:{left_off}px;width:{width}px;{clip}"'
                 f' title="{html_esc(label)}"'
                 f' data-house="{html_esc(house_id)}"'
                 f' data-checkin="{html_esc(b["checkin"])}"'

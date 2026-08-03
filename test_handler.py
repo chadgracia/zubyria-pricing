@@ -769,6 +769,90 @@ t("AT_hd6: exactly 2 occupied nights (Fri, Sat)", body_hd6.count('tape-occ"') ==
 t("AT_hd6: short bar hides inline label", 'tape-bar-nolabel' in body_hd6)
 t("AT_hd6: hidden label still available as tooltip", 'title="Weekend"' in body_hd6)
 
+# AT_hd7 – per-bar inline geometry, one element per block-house, both clip edges
+import re as _re
+
+CELL = lambda_function._TAPE_CELL_W          # 34
+HALF = CELL // 2                             # 0.5-cell shift at the check-in edge
+SLANT = lambda_function._TAPE_SLANT          # 9
+
+def _bars(body):
+    """Every rendered bar as (classes, inline style, title)."""
+    return [
+        (m.group(1), m.group(2), m.group(3))
+        for m in _re.finditer(
+            r'<a class="(tape-bar[^"]*)"[^>]*style="[^;]*;([^"]*)"[^>]*title="([^"]*)"',
+            body)
+    ]
+
+# 2-night block over two houses + 5-night block over one house, same window
+_store_hd7 = FakeStore([
+    {
+        "pk": "blocks", "sk": "block#hd7a",
+        "houses": ["modryna", "zharyna"],
+        "checkin": "2026-08-21", "checkout": "2026-08-23",   # Fri → Sun, 2 nights
+        "label": "TwoNight", "created_by": "admin", "status": "active",
+    },
+    {
+        "pk": "blocks", "sk": "block#hd7b",
+        "houses": ["tseglina"],
+        "checkin": "2026-08-10", "checkout": "2026-08-15",   # 5 nights
+        "label": "FiveNight", "created_by": "admin", "status": "active",
+    },
+])
+lambda_function._store = _store_hd7
+r_hd7 = lambda_function.lambda_handler(
+    ev("/admin", {"key": ADMIN_SECRET, "tab": "block", "month": "2026-08"}), None)
+body_hd7 = r_hd7["body"]
+bars_hd7 = _bars(body_hd7)
+
+two = [b for b in bars_hd7 if b[2] == "TwoNight"]
+five = [b for b in bars_hd7 if b[2] == "FiveNight"]
+
+# Exactly one bar element per block per house lane — never per-cell fragments
+t("AT_hd7: 2-night block renders one bar per house (2 houses)", len(two) == 2)
+t("AT_hd7: 5-night block renders exactly one bar", len(five) == 1)
+t("AT_hd7: no extra bar elements on the chart", len(bars_hd7) == 3)
+
+# Inline geometry: left carries the 0.5-cell shift, width = nights x cell width
+t("AT_hd7: 2-night left offset is the 0.5-cell shift",
+  all(f"left:{HALF}px" in b[1] for b in two))
+t("AT_hd7: 2-night width = 2 x cell width", all(f"width:{2 * CELL}px" in b[1] for b in two))
+t("AT_hd7: 5-night left offset is the 0.5-cell shift", f"left:{HALF}px" in five[0][1])
+t("AT_hd7: 5-night width = 5 x cell width", f"width:{5 * CELL}px" in five[0][1])
+
+# Both lead and trail slants on every bar that is not window-clipped
+_both = f"clip-path:polygon({SLANT}px 0,100% 0,calc(100% - {SLANT}px) 100%,0 100%)"
+t("AT_hd7: every unclipped bar has lead+trail clip-path",
+  all(_both in b[1] for b in bars_hd7))
+t("AT_hd7: every unclipped bar carries both slant markers",
+  all("tape-half-start" in b[0] and "tape-half-end" in b[0] for b in bars_hd7))
+t("AT_hd7: slant is fixed px, never a percentage",
+  all("%" not in b[1].split("polygon(")[1].split(",")[0] for b in bars_hd7))
+
+# Short bars keep a visible body: slant is clamped so it can never eat the whole bar
+t("AT_hd7: 2-night body survives both slants", 2 * CELL - 2 * SLANT > 0)
+_store_hd7c = FakeStore([{
+    "pk": "blocks", "sk": "block#hd7c",
+    "houses": ["tseglina"],
+    "checkin": "2026-08-22", "checkout": "2026-08-23",   # 1 night
+    "label": "OneNight", "created_by": "admin", "status": "active",
+}])
+lambda_function._store = _store_hd7c
+body_hd7c = lambda_function.lambda_handler(
+    ev("/admin", {"key": ADMIN_SECRET, "tab": "block", "month": "2026-08"}), None)["body"]
+one = _bars(body_hd7c)
+t("AT_hd7: 1-night block renders exactly one bar", len(one) == 1)
+t("AT_hd7: 1-night width = 1 x cell width", f"width:{CELL}px" in one[0][1])
+_slant_1n = int(_re.search(r"polygon\((\d+)px", one[0][1]).group(1))
+t("AT_hd7: 1-night slant clamped below half the bar", _slant_1n * 2 < CELL)
+t("AT_hd7: 1-night body still visible", CELL - 2 * _slant_1n >= 16)
+
+# Bars must paint above day-cell backgrounds (weekend/holiday cells shade the row);
+# without this a bar crossing a shaded cell is truncated at the cell edge.
+t("AT_hd7: bars sit above the cell layer", "text-decoration:none;box-sizing:border-box;z-index:2" in body_hd7)
+t("AT_hd7: sticky label column stays above bars", "left:0;z-index:5" in body_hd7)
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 print()
 print(f"Results: {_passed} passed, {_failed} failed out of {_passed + _failed}")
