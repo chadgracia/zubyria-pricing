@@ -31,6 +31,22 @@ def _d(s):
     return date.fromisoformat(s)
 
 
+def _payment_state(b):
+    """Deposit / remaining for a block. Computed at render time, never stored.
+
+    Returns (deposit, remaining, overpaid, priced). remaining is clamped at 0 and is
+    None when the block carries no price snapshot. Anya's bonus is deliberately not
+    involved: it is a share of gross profit, not of cash collected.
+    """
+    deposit = float(b.get("deposit") or 0)
+    snap = b.get("snapshot")
+    if not snap:
+        return deposit, None, False, False
+    subtotal = float(snap.get("subtotal", 0) or 0)
+    raw = subtotal - deposit
+    return deposit, max(0.0, raw), raw < 0, True
+
+
 def _block_color(sk):
     return _BLOCK_COLORS[hash(sk) % len(_BLOCK_COLORS)]
 
@@ -169,6 +185,12 @@ white-space:nowrap;text-overflow:ellipsis;font:10px/22px Verdana,sans-serif;colo
 padding:0 9px;text-decoration:none;box-sizing:border-box;z-index:2}
 .tape-bar:hover{filter:brightness(1.15)}
 .tape-bar-nolabel{font-size:0;padding:0}
+/* Unpaid balance: dashed rule along the bar's foot. Painted as a background-image,
+   which is why bars set background-color (not the background shorthand) inline —
+   the shorthand would reset this to none. */
+.tape-unpaid{background-image:repeating-linear-gradient(90deg,
+rgba(255,255,255,.6) 0 4px,rgba(255,255,255,0) 4px 8px);
+background-repeat:no-repeat;background-position:0 100%;background-size:100% 2px}
 """
 
 # Flatpickr range script with live availability greying (not an f-string to avoid brace escaping)
@@ -452,17 +474,30 @@ def _render_tape_chart(props, blocks, win_start, win_end, today_date, rules,
             edge = ("" if clipped_start else " tape-half-start") + \
                    ("" if clipped_end else " tape-half-end")
 
-            # Under ~3 cells there is no room for text once the slants eat both ends.
-            nolabel = width < 3 * _TAPE_CELL_W
+            # Show the label from ~1.5 cells up; the bar clips it with an ellipsis and
+            # never grows to fit. Below that there is no room, so tooltip only.
+            nolabel = width < 1.5 * _TAPE_CELL_W
             label = b.get("label", "?")
+
+            # Unpaid balance marker — priced blocks still owing money. Fully paid and
+            # unpriced blocks stay unmarked.
+            _dep, _rem, _over, _priced = _payment_state(b)
+            unpaid = " tape-unpaid" if (_priced and _rem and _rem > 0) else ""
+
+            tip = label
+            if (b.get("notes") or "").strip():
+                tip += " · has notes"
+            if unpaid:
+                tip += f" · ${_rem:,.2f} remaining"
+
             detail_url = f"/admin?tab=block&details={html_esc(b['sk'])}{kp}"
             anchored.setdefault(anchor, []).append(
-                f'<a class="tape-bar{slant}{edge}'
+                f'<a class="tape-bar{slant}{edge}{unpaid}'
                 f'{" tape-bar-nolabel" if nolabel else ""}"'
                 f' href="{detail_url}"'
-                f' style="background:{_block_color(b["sk"])};'
+                f' style="background-color:{_block_color(b["sk"])};'
                 f'left:{left_off}px;width:{width}px;{clip}"'
-                f' title="{html_esc(label)}"'
+                f' title="{html_esc(tip)}"'
                 f' data-house="{html_esc(house_id)}"'
                 f' data-checkin="{html_esc(b["checkin"])}"'
                 f' data-checkout="{html_esc(b["checkout"])}">'
@@ -489,7 +524,8 @@ def _render_tape_chart(props, blocks, win_start, win_end, today_date, rules,
     legend = (
         '<p style="color:var(--dim);font-size:11px;margin:4px 0 16px">'
         'bar starts mid-day&nbsp;=&nbsp;check-in 4pm&nbsp;&nbsp;·&nbsp;&nbsp;'
-        'ends mid-day&nbsp;=&nbsp;check-out 10am</p>'
+        'ends mid-day&nbsp;=&nbsp;check-out 10am&nbsp;&nbsp;·&nbsp;&nbsp;'
+        'dashed underline&nbsp;=&nbsp;balance still owing</p>'
     )
     return (
         f'<div class="tape-wrap">'
@@ -593,6 +629,14 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
             for b in priced:
                 hs = ", ".join(props.get(h, {}).get("name", h) for h in b.get("houses", []))
                 snap = b["snapshot"]
+                b_dep, b_rem, b_over, _ = _payment_state(b)
+                if b_over:
+                    paid_cell = (f'${b_dep:,.2f} / <span style="color:var(--err)">'
+                                 f'overpaid</span>')
+                elif b_rem == 0:
+                    paid_cell = f'${b_dep:,.2f} / paid'
+                else:
+                    paid_cell = f'${b_dep:,.2f} / ${b_rem:,.2f}'
                 rows_b += (
                     f'<tr>'
                     f'<td style="padding:8px 12px;border-bottom:1px solid #2a322d">{html_esc(b.get("label","?"))}</td>'
@@ -600,6 +644,7 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
                     f'<td style="padding:8px 12px;border-bottom:1px solid #2a322d">{html_esc(hs)}</td>'
                     f'<td style="padding:8px 12px;border-bottom:1px solid #2a322d">{html_esc(b.get("btype","—"))}</td>'
                     f'<td style="padding:8px 12px;border-bottom:1px solid #2a322d">${snap.get("subtotal",0):,.2f}</td>'
+                    f'<td style="padding:8px 12px;border-bottom:1px solid #2a322d">{paid_cell}</td>'
                     f'<td class="bonus" style="padding:8px 12px;border-bottom:1px solid #2a322d">${snap.get("bonus",0):,.2f}</td>'
                     f'</tr>'
                 )
@@ -607,10 +652,11 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
                 f'<div style="overflow-x:auto"><table {tbl_s}>'
                 f'<thead><tr>'
                 f'<th {th_s}>Label</th><th {th_s}>Dates</th><th {th_s}>Houses</th>'
-                f'<th {th_s}>Type</th><th {th_s}>Guest pays</th><th {th_s}>Anya\'s bonus</th>'
+                f'<th {th_s}>Type</th><th {th_s}>Guest pays</th>'
+                f'<th {th_s}>Paid / remaining</th><th {th_s}>Anya\'s bonus</th>'
                 f'</tr></thead><tbody>{rows_b}</tbody>'
                 f'<tfoot><tr>'
-                f'<td colspan="5" style="padding:10px 12px;font-weight:bold">Total bonus</td>'
+                f'<td colspan="6" style="padding:10px 12px;font-weight:bold">Total bonus</td>'
                 f'<td class="bonus" style="padding:10px 12px;font-weight:bold">${total_bonus:,.2f}</td>'
                 f'</tr></tfoot></table></div>'
             )
@@ -690,6 +736,10 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
             for h in b.get("houses", []):
                 edit_parts.append(f"h_{h}=on")
             edit_parts.append(f"label={urllib.parse.quote(b.get('label', ''), safe='')}")
+            if b.get("notes"):
+                edit_parts.append(f"notes={urllib.parse.quote(b['notes'], safe='')}")
+            if b.get("deposit"):
+                edit_parts.append(f"deposit={b['deposit']}")
             if b.get("btype"):
                 edit_parts.append(f"btype={urllib.parse.quote(b['btype'], safe='')}")
                 qp = b.get("quote_params") or {}
@@ -710,6 +760,27 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
             # Financial section
             from pricing_engine import BOOKING_TYPES as _BT
             snap = b.get("snapshot")
+            dep, remaining, overpaid, _priced = _payment_state(b)
+            if dep:
+                if remaining is None:
+                    pay_html = (
+                        f'<br>Downpayment: ${dep:,.2f}'
+                        f'<br>Remaining: <span style="color:var(--dim)">— (unpriced)</span>'
+                    )
+                elif overpaid:
+                    pay_html = (
+                        f'<br>Downpayment: ${dep:,.2f}'
+                        f'<br>Remaining: $0.00 '
+                        f'<span style="color:var(--err)">(overpaid by '
+                        f'${dep - float(snap.get("subtotal", 0) or 0):,.2f})</span>'
+                    )
+                else:
+                    pay_html = (
+                        f'<br>Downpayment: ${dep:,.2f}'
+                        f'<br>Remaining: ${remaining:,.2f}'
+                    )
+            else:
+                pay_html = ""
             if snap:
                 btype_key = b.get("btype", "cash")
                 bt_info = _BT.get(btype_key, {})
@@ -728,6 +799,7 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
                     f'<span style="color:var(--dim);font-size:11px;font-family:Verdana">'
                     f'{html_esc(bt_label)}</span><br>'
                     f'Guest pays: <b>${subtotal:,.2f}</b>{fee_html}'
+                    f'{pay_html}'
                     f'<br>Gross profit: ${gross_profit:,.2f} &nbsp;·&nbsp; '
                     f'<span class="bonus">Anya\'s bonus (20%): ${bonus:,.2f}</span>'
                     f'</div>'
@@ -750,11 +822,33 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
                             f'<div style="margin-top:6px;font-size:12px;font-family:Verdana;'
                             f'color:var(--dim)">Priced for: {html_esc(", ".join(qp_parts))}</div>'
                         )
+            elif dep:
+                # Deposit recorded but never priced — show what was paid, not a total.
+                finance_html = (
+                    f'<div class="tot" style="border-top:0;margin-top:8px;padding-top:0">'
+                    f'<span style="color:var(--dim);font-size:11px;font-family:Verdana">'
+                    f'No pricing recorded</span>'
+                    f'{pay_html}</div>'
+                )
             else:
                 finance_html = (
                     f'<p style="color:var(--dim);font-size:13px;font-family:Verdana;margin:8px 0 0">'
                     f'No pricing recorded</p>'
                 )
+
+            # Notes — own dim heading, omitted entirely when empty. white-space:pre-wrap
+            # keeps the author's line breaks; html_esc keeps any markup inert.
+            notes_val = (b.get("notes") or "").strip()
+            if notes_val:
+                notes_html = (
+                    f'<div style="margin-top:14px">'
+                    f'<h3 style="font:11px Verdana,sans-serif;text-transform:uppercase;'
+                    f'letter-spacing:.1em;color:var(--dim);margin:0 0 4px">Notes</h3>'
+                    f'<p style="margin:0;font:13px/1.5 Verdana,sans-serif;'
+                    f'white-space:pre-wrap">{html_esc(notes_val)}</p></div>'
+                )
+            else:
+                notes_html = ""
 
             # Two-step cancel: first click shows confirm_cancel on same page;
             # second click (Confirm cancel) triggers the actual cancel action.
@@ -788,6 +882,7 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
                 f'Created by: {html_esc(b.get("created_by",""))}'
                 f'{(" · " + html_esc(created_at_short)) if created_at_short else ""}</p>'
                 f'{finance_html}'
+                f'{notes_html}'
                 f'<div style="border-top:1px solid #2a322d;margin-top:14px;padding-top:12px;'
                 f'display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
                 f'<a href="{html_esc(edit_url)}" class="btn-sec">Edit</a>'
@@ -860,7 +955,23 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
             f'<label>Pets <input type="number" name="pets" min="0" value="{html_esc(pf.get("pets","0"))}" style="width:60px"></label>'
             f'<label>Event <input type="checkbox" name="event"{ev_chk}></label>'
             f'<label>Event guests <input type="number" name="event_guests" min="0" value="{html_esc(pf.get("event_guests","0"))}" style="width:60px"></label>'
-            f'</div></div></details>'
+            f'</div>'
+            f'<div class="row" style="margin-top:10px">'
+            f'<label>Downpayment ($) <input type="number" name="deposit" min="0" step="0.01" '
+            f'value="{html_esc(pf.get("deposit",""))}" placeholder="0.00" style="width:90px"></label>'
+            f'</div>'
+            f'</div></details>'
+        )
+
+        notes_field = (
+            f'<label style="display:block;margin-top:12px">'
+            f'<span style="display:block;color:var(--dim);font:12px Verdana;margin-bottom:4px">'
+            f'Notes (optional)</span>'
+            f'<textarea name="notes" rows="3" placeholder="Anything worth remembering about this booking" '
+            f'style="width:100%;max-width:420px;box-sizing:border-box;background:var(--bg);'
+            f'color:var(--ink);border:1px solid #333c36;border-radius:4px;padding:6px 8px;'
+            f'font:12px Verdana,sans-serif;resize:vertical">'
+            f'{html_esc(pf.get("notes",""))}</textarea></label>'
         )
 
         if msg:
@@ -898,6 +1009,7 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
             f'<fieldset><legend>Guest / reason</legend>'
             f'<input type="text" name="label" value="{label_val}" '
             f'placeholder="Guest name or reason" required style="min-width:260px">'
+            f'{notes_field}'
             f'{pricing_expander}</fieldset>'
             f'<button type="submit">{block_btn}</button>'
             f'<a href="{html_esc(back_href)}" class="btn-sec" style="margin-left:10px">← Calculator</a>'
@@ -987,6 +1099,13 @@ def _lambda_handler(event, context):
             dates_str = qs.get("dates", "")
             houses = [h for h in props if qs.get(f"h_{h}") == "on"]
             label = qs.get("label", "").strip()
+            notes = qs.get("notes", "").strip()
+            try:
+                deposit = float(qs.get("deposit", "") or 0)
+            except ValueError:
+                deposit = 0.0
+            if deposit < 0:
+                deposit = 0.0
             try:
                 parts = [s.strip() for s in
                          dates_str.replace(" to ", "|").replace(" — ", "|").split("|")]
@@ -1036,6 +1155,8 @@ def _lambda_handler(event, context):
                     snapshot=snapshot,
                     quote_params=quote_params_out,
                     btype=snap_btype or None,
+                    notes=notes or None,
+                    deposit=deposit or None,
                 )
                 if r["ok"]:
                     if edit_id:

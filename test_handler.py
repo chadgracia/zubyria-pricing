@@ -38,7 +38,8 @@ class FakeStore:
         return result
 
     def add_block(self, houses, checkin, checkout, label, created_by="admin",
-                  exclude_id=None, snapshot=None, quote_params=None, btype=None):
+                  exclude_id=None, snapshot=None, quote_params=None, btype=None,
+                  notes=None, deposit=None):
         ci_d = checkin if isinstance(checkin, date) else date.fromisoformat(str(checkin))
         co_d = checkout if isinstance(checkout, date) else date.fromisoformat(str(checkout))
         conflicts = []
@@ -73,6 +74,10 @@ class FakeStore:
             item["quote_params"] = quote_params
         if btype:
             item["btype"] = btype
+        if notes:
+            item["notes"] = notes
+        if deposit:
+            item["deposit"] = deposit
         self._blocks.append(item)
         return {"ok": True}
 
@@ -852,6 +857,207 @@ t("AT_hd7: 1-night body still visible", CELL - 2 * _slant_1n >= 16)
 # without this a bar crossing a shaded cell is truncated at the cell edge.
 t("AT_hd7: bars sit above the cell layer", "text-decoration:none;box-sizing:border-box;z-index:2" in body_hd7)
 t("AT_hd7: sticky label column stays above bars", "left:0;z-index:5" in body_hd7)
+
+# ── AT_nd: short-bar labels, notes, downpayment ──────────────────────────────
+
+print("\n=== Labels / notes / downpayment tests ===")
+
+# AT_nd1 – a 2-night block keeps its inline label; a 1-night block is tooltip-only
+_store_nd1 = FakeStore([
+    {
+        "pk": "blocks", "sk": "block#nd1a",
+        "houses": ["tseglina"],
+        "checkin": "2026-08-21", "checkout": "2026-08-23",   # 2 nights
+        "label": "wedding", "created_by": "admin", "status": "active",
+    },
+    {
+        "pk": "blocks", "sk": "block#nd1b",
+        "houses": ["modryna"],
+        "checkin": "2026-08-21", "checkout": "2026-08-22",   # 1 night
+        "label": "solo", "created_by": "admin", "status": "active",
+    },
+])
+lambda_function._store = _store_nd1
+body_nd1 = lambda_function.lambda_handler(
+    ev("/admin", {"key": ADMIN_SECRET, "tab": "block", "month": "2026-08"}), None)["body"]
+_nd1_bars = {t_[2]: t_ for t_ in _bars(body_nd1)}
+# the label must sit inside the bar element, not just in the tooltip
+t("AT_nd1: 2-night bar body contains its label text",
+  _re.search(r'<a class="tape-bar[^"]*"[^>]*title="wedding"[^>]*>wedding</a>', body_nd1) is not None)
+t("AT_nd1: 2-night bar is not marked nolabel",
+  "tape-bar-nolabel" not in _nd1_bars["wedding"][0])
+t("AT_nd1: 1-night bar is tooltip-only", "tape-bar-nolabel" in _nd1_bars["solo"][0])
+t("AT_nd1: 1-night bar renders no inline text",
+  _re.search(r'title="solo"[^>]*></a>', body_nd1) is not None)
+t("AT_nd1: label truncation is clipped, never widening the bar",
+  "overflow:hidden" in body_nd1 and "text-overflow:ellipsis" in body_nd1)
+
+# AT_nd2 – notes round-trip: add → details → edit, and HTML in notes is escaped
+_store_nd2 = FakeStore()
+lambda_function._store = _store_nd2
+r_nd2 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "action": "add_block",
+    "dates": "2026-09-10 to 2026-09-13",
+    "h_tseglina": "on", "label": "Notes Guest",
+    "notes": "Late arrival <script>alert(1)</script> & pets",
+}), None)
+t("AT_nd2: add_block with notes succeeds", "Block added" in r_nd2["body"])
+_nd2_item = [b for b in _store_nd2._blocks if b.get("label") == "Notes Guest"][0]
+t("AT_nd2: notes stored on the item",
+  _nd2_item.get("notes") == "Late arrival <script>alert(1)</script> & pets")
+
+r_nd2d = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "details": _nd2_item["sk"],
+}), None)
+body_nd2d = r_nd2d["body"]
+t("AT_nd2: details shows the Notes heading", ">Notes</h3>" in body_nd2d)
+t("AT_nd2: details shows the note text", "Late arrival" in body_nd2d)
+t("AT_nd2: raw script tag is escaped in details",
+  "<script>alert(1)</script>" not in body_nd2d and "&lt;script&gt;" in body_nd2d)
+t("AT_nd2: ampersand escaped in details", "&amp; pets" in body_nd2d)
+t("AT_nd2: edit link carries the notes for pre-fill", "notes=Late%20arrival" in body_nd2d)
+
+# Edit view pre-fills the textarea with the stored notes, escaped
+r_nd2e = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "edit_id": _nd2_item["sk"],
+    "dates": "2026-09-10 to 2026-09-13", "h_tseglina": "on",
+    "label": "Notes Guest", "notes": "Late arrival <b>x</b>",
+}), None)
+t("AT_nd2: edit form has a notes textarea", 'name="notes"' in r_nd2e["body"])
+t("AT_nd2: edit textarea pre-filled and escaped",
+  "Late arrival &lt;b&gt;x&lt;/b&gt;</textarea>" in r_nd2e["body"])
+
+# Blocks without notes omit the section entirely
+_store_nd2b = FakeStore([{
+    "pk": "blocks", "sk": "block#nd2b",
+    "houses": ["tseglina"], "checkin": "2026-09-10", "checkout": "2026-09-13",
+    "label": "No Notes", "created_by": "admin", "status": "active",
+}])
+lambda_function._store = _store_nd2b
+body_nd2b = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "details": "block#nd2b"}), None)["body"]
+t("AT_nd2: block without notes omits the Notes section", ">Notes</h3>" not in body_nd2b)
+
+# AT_nd3 – deposit 500 against a 3600 subtotal → Remaining 3100 in details and BONUS
+_snap_nd3 = {"subtotal": 3600.0, "gross_profit": 3000.0, "bonus": 600.0}
+_store_nd3 = FakeStore([{
+    "pk": "blocks", "sk": "block#nd3",
+    "houses": ["tseglina"], "checkin": "2026-09-10", "checkout": "2026-09-13",
+    "label": "Deposit Guest", "created_by": "admin", "status": "active",
+    "btype": "cash", "snapshot": _snap_nd3, "deposit": 500.0,
+}])
+lambda_function._store = _store_nd3
+body_nd3 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "details": "block#nd3"}), None)["body"]
+t("AT_nd3: details shows the downpayment", "Downpayment: $500.00" in body_nd3)
+t("AT_nd3: details shows remaining 3100", "Remaining: $3,100.00" in body_nd3)
+body_nd3b = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "bonus", "month": "2026-09"}), None)["body"]
+t("AT_nd3: BONUS tab has a paid/remaining column", "Paid / remaining" in body_nd3b)
+t("AT_nd3: BONUS row shows paid and remaining", "$500.00 / $3,100.00" in body_nd3b)
+t("AT_nd3: bonus value unaffected by the deposit", "$600.00" in body_nd3b)
+
+# AT_nd4 – deposit with no snapshot → unpriced dash, no fabricated remaining
+_store_nd4 = FakeStore([{
+    "pk": "blocks", "sk": "block#nd4",
+    "houses": ["tseglina"], "checkin": "2026-09-10", "checkout": "2026-09-13",
+    "label": "Unpriced Deposit", "created_by": "admin", "status": "active",
+    "deposit": 250.0,
+}])
+lambda_function._store = _store_nd4
+body_nd4 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "details": "block#nd4"}), None)["body"]
+t("AT_nd4: unpriced block still shows the deposit", "Downpayment: $250.00" in body_nd4)
+t("AT_nd4: unpriced block shows the remaining dash", "— (unpriced)" in body_nd4)
+t("AT_nd4: unpriced block still says no pricing recorded", "No pricing recorded" in body_nd4)
+
+# AT_nd5 – deposit greater than subtotal is flagged as an overpayment
+_store_nd5 = FakeStore([{
+    "pk": "blocks", "sk": "block#nd5",
+    "houses": ["tseglina"], "checkin": "2026-09-10", "checkout": "2026-09-13",
+    "label": "Overpaid Guest", "created_by": "admin", "status": "active",
+    "btype": "cash", "deposit": 900.0,
+    "snapshot": {"subtotal": 700.0, "gross_profit": 600.0, "bonus": 120.0},
+}])
+lambda_function._store = _store_nd5
+body_nd5 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "details": "block#nd5"}), None)["body"]
+t("AT_nd5: overpayment flagged", "overpaid by $200.00" in body_nd5)
+t("AT_nd5: overpayment uses the --err colour", "var(--err)" in body_nd5)
+t("AT_nd5: remaining clamped at zero", "Remaining: $0.00" in body_nd5)
+
+# AT_nd6 – deposits never move Anya's bonus (bonus is on gross profit, not cash)
+_paid = {
+    "pk": "blocks", "sk": "block#nd6a",
+    "houses": ["tseglina"], "checkin": "2026-09-10", "checkout": "2026-09-13",
+    "label": "Fully Paid", "created_by": "admin", "status": "active",
+    "btype": "cash", "snapshot": {"subtotal": 1000.0, "gross_profit": 800.0, "bonus": 160.0},
+}
+lambda_function._store = FakeStore([dict(_paid)])
+_no_dep = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "bonus", "month": "2026-09"}), None)["body"]
+lambda_function._store = FakeStore([dict(_paid, deposit=1000.0)])
+_with_dep = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "bonus", "month": "2026-09"}), None)["body"]
+t("AT_nd6: total bonus identical with and without a deposit",
+  _re.search(r"Total bonus</td>.*?\$([\d,.]+)", _no_dep, _re.S).group(1)
+  == _re.search(r"Total bonus</td>.*?\$([\d,.]+)", _with_dep, _re.S).group(1))
+t("AT_nd6: fully paid row reads 'paid'", "$1,000.00 / paid" in _with_dep)
+
+# AT_nd7 – chart marks bars with a balance still owing; paid/unpriced stay unmarked
+_store_nd7 = FakeStore([
+    dict(_paid, sk="block#nd7a", label="Owing", checkin="2026-09-04",
+         checkout="2026-09-09", deposit=200.0),
+    dict(_paid, sk="block#nd7b", label="Settled", checkin="2026-09-14",
+         checkout="2026-09-19", deposit=1000.0, houses=["modryna"]),
+    {"pk": "blocks", "sk": "block#nd7c", "houses": ["zharyna"],
+     "checkin": "2026-09-04", "checkout": "2026-09-09", "label": "NoPrice",
+     "created_by": "admin", "status": "active"},
+])
+lambda_function._store = _store_nd7
+body_nd7 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "month": "2026-09"}), None)["body"]
+_nd7 = {t_[2].split(" ·")[0]: t_ for t_ in _bars(body_nd7)}
+t("AT_nd7: bar with a balance owing is marked", "tape-unpaid" in _nd7["Owing"][0])
+t("AT_nd7: fully paid bar is unmarked", "tape-unpaid" not in _nd7["Settled"][0])
+t("AT_nd7: unpriced bar is unmarked", "tape-unpaid" not in _nd7["NoPrice"][0])
+t("AT_nd7: remaining shown in the tooltip", "Owing · $800.00 remaining" in body_nd7)
+t("AT_nd7: legend mentions the marker", "balance still owing" in body_nd7)
+
+# AT_nd8 – notes hint appears in the bar tooltip, never as bar text
+_store_nd8 = FakeStore([{
+    "pk": "blocks", "sk": "block#nd8", "houses": ["tseglina"],
+    "checkin": "2026-09-04", "checkout": "2026-09-09", "label": "Tooltip Guest",
+    "created_by": "admin", "status": "active", "notes": "call ahead",
+}])
+lambda_function._store = _store_nd8
+body_nd8 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "month": "2026-09"}), None)["body"]
+t("AT_nd8: tooltip carries the has-notes hint",
+  'title="Tooltip Guest · has notes"' in body_nd8)
+t("AT_nd8: note text never rendered on the bar", "call ahead" not in body_nd8)
+t("AT_nd8: bar text stays the plain label", ">Tooltip Guest</a>" in body_nd8)
+
+# AT_nd9 – deposit is written through a table mock that rejects floats
+_strict_nd9 = StrictDynamoTable()
+_store_nd9 = Store(_strict_nd9)
+_r_nd9 = _store_nd9.add_block(
+    houses=["tseglina"], checkin=date(2026, 11, 1), checkout=date(2026, 11, 3),
+    label="Deposit decimal", notes="fine", deposit=500.5,
+    snapshot={"subtotal": 3600.0, "gross_profit": 3000.0, "bonus": 600.0},
+)
+t("AT_nd9: deposit survives a float-rejecting table", _r_nd9.get("ok") is True)
+_back_nd9 = _store_nd9.list_blocks()[0]
+t("AT_nd9: deposit reads back as a native float", _back_nd9.get("deposit") == 500.5)
+t("AT_nd9: deposit is not a Decimal", not isinstance(_back_nd9.get("deposit"), Decimal))
+t("AT_nd9: notes round-trip through the store", _back_nd9.get("notes") == "fine")
+
+# AT_nd10 – non-admin sees none of the new block data
+lambda_function._store = _store_nd3
+r_nd10 = lambda_function.lambda_handler(ev("/admin", {"tab": "block", "details": "block#nd3"}), None)
+t("AT_nd10: non-admin sees no deposit", "Downpayment" not in r_nd10["body"])
+t("AT_nd10: non-admin sees no notes section", ">Notes</h3>" not in r_nd10["body"])
+t("AT_nd10: non-admin denied", "Access denied" in r_nd10["body"])
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 print()

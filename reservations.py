@@ -85,7 +85,8 @@ class Store:
         return result
 
     def add_block(self, houses, checkin, checkout, label, created_by="admin",
-                  exclude_id=None, snapshot=None, quote_params=None, btype=None):
+                  exclude_id=None, snapshot=None, quote_params=None, btype=None,
+                  notes=None, deposit=None):
         """Check availability for the given houses (excluding exclude_id block); if any conflict,
         return {"ok": False, "conflicts": [label, ...]} without writing.
         On success write the item and return {"ok": True, "id": sk}."""
@@ -114,6 +115,11 @@ class Store:
             item["quote_params"] = quote_params
         if btype:
             item["btype"] = btype
+        if notes:
+            item["notes"] = notes
+        if deposit:
+            # _to_dynamo turns the float into a Decimal at the store boundary.
+            item["deposit"] = deposit
         self._t.put_item(Item=_to_dynamo(item))
         return {"ok": True, "id": sk}
 
