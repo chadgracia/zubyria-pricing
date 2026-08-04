@@ -6,7 +6,31 @@ permissions:
   id-token: write
   contents: read
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      # The suite is a flat script, so an exception part-way through skips every
+      # later assertion. A non-zero exit catches that, but we also require the
+      # explicit completion line: it is printed only after the last assertion has
+      # run, so a partial run can never be mistaken for a pass.
+      - name: Run test suite
+        run: |
+          set -o pipefail
+          python test_handler.py 2>&1 | tee test-output.txt
+      - name: Require the suite to have run to completion
+        run: |
+          grep -qE '^SUITE COMPLETE: [0-9]+ assertions$' test-output.txt || {
+            echo "::error::Test suite did not run to completion — refusing to deploy."
+            exit 1
+          }
+          echo "Gate passed: $(grep '^SUITE COMPLETE:' test-output.txt)"
+
   deploy:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

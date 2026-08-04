@@ -9,6 +9,27 @@ ADMIN_SECRET = lambda_function.ADMIN_SECRET
 _passed = 0
 _failed = 0
 
+# --- abort guard -----------------------------------------------------------
+# This file is a flat script: an exception part-way through skips every later
+# assertion. Python does exit non-zero on an uncaught exception, but a silent
+# partial run still LOOKS like a pass in logs, so the run is only ever trusted
+# when the final "SUITE COMPLETE" line is present. The deploy gate greps for it.
+import atexit
+import os as _os
+
+_suite_completed = False
+
+
+def _abort_guard():
+    if not _suite_completed:
+        print("\nSUITE ABORTED before completion — "
+              "assertions after the failure point never ran.")
+        sys.stdout.flush()
+        _os._exit(1)
+
+
+atexit.register(_abort_guard)
+
 
 class FakeStore:
     def __init__(self, blocks=None):
@@ -965,7 +986,13 @@ t("AT_nd2: details shows the note text", "Late arrival" in body_nd2d)
 t("AT_nd2: raw script tag is escaped in details",
   "<script>alert(1)</script>" not in body_nd2d and "&lt;script&gt;" in body_nd2d)
 t("AT_nd2: ampersand escaped in details", "&amp; pets" in body_nd2d)
-t("AT_nd2: edit link carries the notes for pre-fill", "notes=Late%20arrival" in body_nd2d)
+t("AT_nd2: edit link is minimal (no data threaded through the URL)",
+  f'edit_id={_nd2_item["sk"]}' in body_nd2d.replace("%23", "#")
+  and "notes=Late%20arrival" not in body_nd2d)
+_nd2_edit = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "edit_id": _nd2_item["sk"]}), None)["body"]
+t("AT_nd2: edit screen pre-fills notes from the block, escaped",
+  "Late arrival &lt;script&gt;" in _nd2_edit)
 
 # Edit view pre-fills the textarea with the stored notes, escaped
 r_nd2e = lambda_function.lambda_handler(ev("/admin", {
@@ -1183,8 +1210,14 @@ t("AT_ov3: recomputed commission shown", "Airbnb commission: $465.00" in body_ov
 t("AT_ov3: recomputed gross profit shown", "Gross profit: $2,335.00" in body_ov3)
 t("AT_ov3: recomputed bonus shown", "$467.00" in body_ov3)
 t("AT_ov3: airbnb listing price shown", "List at: $3,550.30" in body_ov3)
-t("AT_ov3: edit price control present", ">Edit price</summary>" in body_ov3)
-t("AT_ov3: revert control present", "Revert to calculated" in body_ov3)
+t("AT_ov3: details is read-only — price form lives on the Edit screen",
+  ">Edit price</summary>" not in body_ov3 and 'name="final_price"' not in body_ov3)
+t("AT_ov3: details links to the Edit screen", "edit_id=" in body_ov3)
+_ov3_edit = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "edit_id": "block#ov"}), None)["body"]
+t("AT_ov3: edit screen exposes the final-price field", 'name="final_price"' in _ov3_edit)
+t("AT_ov3: edit screen prefills the override amount", 'value="3000.00"' in _ov3_edit)
+t("AT_ov3: revert control on the Edit screen", "Revert to calculated" in _ov3_edit)
 
 # AT_ov4 – revert restores the computed numbers and drops override-only fields
 lambda_function._store = _store_ov2
@@ -1537,8 +1570,212 @@ t("AT_pl11: payment amounts read back as native floats",
 t("AT_pl11: received sums the stored ledger",
   lambda_function._payment_state(_read_pl)[0] == 1024.75)
 
+# ── AT_ue: unified Edit screen ───────────────────────────────────────────────
+
+print("\n=== Unified Edit screen tests ===")
+
+PROPS_UE = FALLBACK_RULES["properties"]
+
+def _edit(store, sk):
+    lambda_function._store = store
+    return lambda_function.lambda_handler(ev("/admin", {
+        "key": ADMIN_SECRET, "tab": "block", "edit_id": sk}), None)["body"]
+
+def _save(store, sk, **fields):
+    lambda_function._store = store
+    q = {"key": ADMIN_SECRET, "tab": "block", "action": "add_block", "edit_id": sk}
+    q.update({k: str(v) for k, v in fields.items()})
+    return lambda_function.lambda_handler(ev("/admin", q), None)
+
+def _active(store, checkin):
+    return [b for b in store._blocks
+            if b.get("status") == "active" and b.get("checkin") == checkin][0]
+
+# AT_ue1 – all three sections are present and visible on one page
+_store_ue1 = FakeStore([_pl_block(_two)])
+body_ue1 = _edit(_store_ue1, "block#pl")
+t("AT_ue1: stay section present", "1 · Stay" in body_ue1)
+t("AT_ue1: price section present", "2 · Price" in body_ue1)
+t("AT_ue1: payments section present", "3 · Payments" in body_ue1)
+t("AT_ue1: stay fields prefilled", 'value="2026-09-10 to 2026-09-13"' in body_ue1)
+t("AT_ue1: label prefilled", 'value="Ledger Guest"' in body_ue1)
+t("AT_ue1: existing payments listed", "2026-10-05" in body_ue1 and "2026-11-20" in body_ue1)
+t("AT_ue1: received/outstanding shown", "Received:" in body_ue1 and "Outstanding:" in body_ue1)
+t("AT_ue1: add-payment row present", 'name="pay_amount"' in body_ue1)
+t("AT_ue1: pricing controls are NOT hidden behind a disclosure",
+  "<details" not in body_ue1)
+t("AT_ue1: single submit for the whole page", body_ue1.count("<form") == 1)
+
+# AT_ue2 – editing an UNPRICED block and setting btype prices it
+_store_ue2 = FakeStore([{
+    "pk": "blocks", "sk": "block#unp2", "houses": ["tseglina"],
+    "checkin": "2026-09-10", "checkout": "2026-09-13", "label": "Was Unpriced",
+    "created_by": "admin", "status": "active",
+}])
+body_ue2 = _edit(_store_ue2, "block#unp2")
+t("AT_ue2: unpriced block still offers the booking-type select",
+  'name="btype"' in body_ue2)
+t("AT_ue2: unpriced block prompts for a booking type",
+  "Choose a booking type" in body_ue2)
+r_ue2 = _save(_store_ue2, "block#unp2",
+              dates="2026-09-10 to 2026-09-13", h_tseglina="on",
+              label="Was Unpriced", btype="cash", g_tseglina="4")
+t("AT_ue2: save succeeds", "Block updated" in r_ue2["body"])
+_new_ue2 = _active(_store_ue2, "2026-09-10")
+t("AT_ue2: snapshot now exists", bool(_new_ue2.get("snapshot")))
+t("AT_ue2: snapshot has a subtotal", _new_ue2["snapshot"]["subtotal"] > 0)
+t("AT_ue2: snapshot has a bonus", _new_ue2["snapshot"]["bonus"] > 0)
+t("AT_ue2: btype recorded", _new_ue2.get("btype") == "cash")
+t("AT_ue2: no override created when priced from scratch",
+  "override_subtotal" not in _new_ue2["snapshot"])
+
+# AT_ue3 – a final price differing from calculated creates an override
+_store_ue3 = FakeStore([{
+    "pk": "blocks", "sk": "block#ue3", "houses": ["tseglina"],
+    "checkin": "2026-09-10", "checkout": "2026-09-13", "label": "Discount Guest",
+    "created_by": "admin", "status": "active", "btype": "cash",
+}])
+_r_calc = _save(_store_ue3, "block#ue3", dates="2026-09-10 to 2026-09-13",
+                h_tseglina="on", label="Discount Guest", btype="cash", g_tseglina="4")
+_calc_sub = _active(_store_ue3, "2026-09-10")["snapshot"]["subtotal"]
+_sk3 = _active(_store_ue3, "2026-09-10")["sk"]
+r_ue3 = _save(_store_ue3, _sk3, dates="2026-09-10 to 2026-09-13", h_tseglina="on",
+              label="Discount Guest", btype="cash", g_tseglina="4",
+              final_price=f"{_calc_sub - 200:.2f}", price_note="friend discount")
+_new_ue3 = _active(_store_ue3, "2026-09-10")
+t("AT_ue3: override created from the Final price field",
+  _new_ue3["snapshot"].get("override_subtotal") == round(_calc_sub - 200, 2))
+t("AT_ue3: computed price preserved alongside",
+  _new_ue3["snapshot"]["computed_subtotal"] == _calc_sub)
+t("AT_ue3: reason stored", _new_ue3.get("price_note") == "friend discount")
+_det_ue3 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "details": _new_ue3["sk"]}), None)["body"]
+t("AT_ue3: details shows the final price", "Final price:" in _det_ue3)
+t("AT_ue3: details shows both prices", "line-through" in _det_ue3
+  and f"${_calc_sub:,.2f}" in _det_ue3)
+t("AT_ue3: details shows the custom reason", "friend discount" in _det_ue3)
+
+# AT_ue4 – leaving Final price equal to calculated stores no override
+_store_ue4 = FakeStore([{
+    "pk": "blocks", "sk": "block#ue4", "houses": ["tseglina"],
+    "checkin": "2026-09-10", "checkout": "2026-09-13", "label": "Full Price",
+    "created_by": "admin", "status": "active", "btype": "cash",
+}])
+_save(_store_ue4, "block#ue4", dates="2026-09-10 to 2026-09-13", h_tseglina="on",
+      label="Full Price", btype="cash", g_tseglina="4")
+_c4 = _active(_store_ue4, "2026-09-10")["snapshot"]["subtotal"]
+_sk4 = _active(_store_ue4, "2026-09-10")["sk"]
+_save(_store_ue4, _sk4, dates="2026-09-10 to 2026-09-13", h_tseglina="on",
+      label="Full Price", btype="cash", g_tseglina="4", final_price=f"{_c4:.2f}")
+_n4 = _active(_store_ue4, "2026-09-10")
+t("AT_ue4: equal final price stores no override",
+  "override_subtotal" not in _n4["snapshot"])
+t("AT_ue4: subtotal is still the calculated one", _n4["snapshot"]["subtotal"] == _c4)
+
+# AT_ue5 – adding a payment from the Edit screen updates totals and the BONUS tab
+_store_ue5 = FakeStore([_pl_block([_two[0]])])
+r_ue5 = _save(_store_ue5, "block#pl", dates="2026-09-10 to 2026-09-13",
+              h_tseglina="on", label="Ledger Guest", btype="cash",
+              pay_amount="2625", pay_date="2026-11-20", pay_note="balance")
+t("AT_ue5: save succeeds", "Block updated" in r_ue5["body"])
+_n5 = _active(_store_ue5, "2026-09-10")
+t("AT_ue5: payment appended to the ledger", len(_n5["payments"]) == 2)
+t("AT_ue5: carried payment kept", any(p["amount"] == 1000.0 for p in _n5["payments"]))
+t("AT_ue5: new payment recorded", any(p["amount"] == 2625.0 for p in _n5["payments"]))
+_rec5, _out5, _, _ = lambda_function._payment_state(_n5)
+t("AT_ue5: received updated to 3625", _rec5 == 3625.0)
+t("AT_ue5: outstanding now zero", _out5 == 0.0)
+_edit5 = _edit(_store_ue5, _n5["sk"])
+t("AT_ue5: edit screen reflects the new totals", "$3,625.00" in _edit5)
+_q5 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "bonus", "q": "4", "year": "2026"}), None)["body"]
+t("AT_ue5: payment appears in the quarterly bonus report", "2026-11-20" in _q5)
+_ratio5 = lambda_function._bonus_ratio(_n5)
+t("AT_ue5: quarterly bonus accrues at the re-derived ratio",
+  f"${round(2625.0 * _ratio5, 2):,.2f}" in _q5)
+t("AT_ue5: ratio comes from the recomputed snapshot, not the stale one",
+  abs(_ratio5 - 568.40 / 3625.0) > 1e-9)
+
+# AT_ue6 – a conflicting date change rejects the WHOLE save, payment included
+_store_ue6 = FakeStore([
+    _pl_block([_two[0]]),
+    {"pk": "blocks", "sk": "block#blocker", "houses": ["tseglina"],
+     "checkin": "2026-09-20", "checkout": "2026-09-25", "label": "Blocker",
+     "created_by": "admin", "status": "active"},
+])
+_before6 = len(_store_ue6._blocks)
+r_ue6 = _save(_store_ue6, "block#pl", dates="2026-09-21 to 2026-09-24",
+              h_tseglina="on", label="Ledger Guest", btype="cash",
+              final_price="999", price_note="should not stick",
+              pay_amount="500", pay_date="2026-11-05")
+t("AT_ue6: conflict reported naming the blocker",
+  "Conflict" in r_ue6["body"] and "Blocker" in r_ue6["body"])
+t("AT_ue6: no new block written", len(_store_ue6._blocks) == _before6)
+_orig6 = [b for b in _store_ue6._blocks if b["sk"] == "block#pl"][0]
+t("AT_ue6: original block untouched and active",
+  _orig6["status"] == "active" and _orig6["checkin"] == "2026-09-10")
+t("AT_ue6: payment from the same submit NOT written",
+  len(_orig6["payments"]) == 1 and _orig6["payments"][0]["amount"] == 1000.0)
+t("AT_ue6: override from the same submit NOT written",
+  "override_subtotal" not in _orig6.get("snapshot", {}))
+t("AT_ue6: price_note from the same submit NOT written",
+  _orig6.get("price_note") in (None, ""))
+t("AT_ue6: rejected save re-renders the edit screen with submitted values",
+  "2026-09-21 to 2026-09-24" in r_ue6["body"] and "3 · Payments" in r_ue6["body"])
+
+# AT_ue7 – removing a payment from the Edit screen returns to the Edit screen
+_store_ue7 = FakeStore([_pl_block(_two)])
+lambda_function._store = _store_ue7
+_pid7 = _two[1]["id"]
+r_ue7a = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "edit_id": "block#pl",
+    "confirm_rm": _pid7}), None)["body"]
+t("AT_ue7: remove needs confirmation on the edit screen", "confirm remove" in r_ue7a)
+t("AT_ue7: nothing removed at the confirm step",
+  len(_store_ue7._blocks[0]["payments"]) == 2)
+r_ue7b = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "action": "remove_payment",
+    "block_id": "block#pl", "payment_id": _pid7, "back": "edit"}), None)["body"]
+t("AT_ue7: confirmed remove deletes it",
+  len(_store_ue7._blocks[0]["payments"]) == 1)
+t("AT_ue7: returns to the edit screen, not details", "3 · Payments" in r_ue7b)
+
+# AT_ue9 – a stale snapshot must not become a silent override on an unchanged Save.
+# This block's stored subtotal (3625) does not match what the engine now calculates,
+# so prefilling from the stored value would pin the stale number as a custom price.
+_store_ue9 = FakeStore([_pl_block([], btype="cash")])
+body_ue9 = _edit(_store_ue9, "block#pl")
+_live9 = lambda_function._quote_for_prefill(
+    lambda_function._edit_prefill(_store_ue9._blocks[0], PROPS_UE, {}), PROPS_UE)
+t("AT_ue9: calculated price differs from the stale stored subtotal",
+  _live9 is not None and abs(_live9.subtotal - 3625.0) > 0.01)
+t("AT_ue9: final price prefills from the calculated value, not the stale one",
+  f'value="{_live9.subtotal:.2f}"' in body_ue9)
+r_ue9 = _save(_store_ue9, "block#pl", dates="2026-09-10 to 2026-09-13",
+              h_tseglina="on", label="Ledger Guest", btype="cash",
+              final_price=f"{_live9.subtotal:.2f}")
+_n9 = _active(_store_ue9, "2026-09-10")
+t("AT_ue9: unchanged Save creates no override",
+  "override_subtotal" not in _n9["snapshot"])
+# ...but a block that really does carry an override still prefills with it
+_store_ue9b = FakeStore([_pl_block([], btype="cash", override_subtotal=2000.0,
+                                   snapshot=lambda_function._apply_override(
+                                       dict(_PL_SNAP), "cash", 2000.0))])
+t("AT_ue9: an existing override still prefills the field",
+  'value="2000.00"' in _edit(_store_ue9b, "block#pl"))
+
+# AT_ue8 – non-admin cannot reach the edit screen
+r_ue8 = lambda_function.lambda_handler(ev("/admin", {
+    "tab": "block", "edit_id": "block#pl"}), None)
+t("AT_ue8: non-admin denied the edit screen",
+  "Access denied" in r_ue8["body"] and "1 · Stay" not in r_ue8["body"])
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 print()
 print(f"Results: {_passed} passed, {_failed} failed out of {_passed + _failed}")
+
+# Only reached if every assertion above ran. The deploy gate requires this line.
+_suite_completed = True
+print(f"SUITE COMPLETE: {_passed + _failed} assertions")
 if _failed:
     sys.exit(1)

@@ -91,6 +91,246 @@ def _revert_override(snap):
     return out
 
 
+def _edit_prefill(b, props, qs):
+    """Form values for the unified Edit screen.
+
+    A fresh Edit click carries only edit_id, so everything is read off the block
+    server-side. A re-render after a rejected save carries the submitted values, so
+    those win and the user does not lose their input.
+    """
+    if qs.get("dates"):
+        return dict(qs)
+    pf = {
+        "dates": f'{b.get("checkin","")} to {b.get("checkout","")}',
+        "label": b.get("label", ""),
+        "notes": b.get("notes", ""),
+        "btype": b.get("btype", ""),
+        "price_note": b.get("price_note", ""),
+    }
+    for h in b.get("houses", []):
+        pf[f"h_{h}"] = "on"
+    qp = b.get("quote_params") or {}
+    if isinstance(qp.get("houses"), dict):
+        for h, g in qp["houses"].items():
+            pf[f"g_{h}"] = str(g)
+    for k in ("jacuzzi", "pets", "event_guests"):
+        if qp.get(k):
+            pf[k] = str(qp[k])
+    if qp.get("event"):
+        pf["event"] = "on"
+    # Prefill the final price ONLY from an existing override. Falling back to the
+    # stored subtotal would be wrong: if the calculated price has since drifted
+    # (rules changed, stale snapshot), pressing Save unchanged would silently mint
+    # an override pinning the old number. With no override the field defaults to the
+    # freshly calculated price, so an unchanged Save is genuinely a no-op.
+    if b.get("override_subtotal"):
+        pf["final_price"] = f"{float(b['override_subtotal']):.2f}"
+    return pf
+
+
+def _quote_for_prefill(pf, props):
+    """Live quote for the values currently in the Edit form, or None."""
+    btype = (pf.get("btype") or "").strip()
+    if btype not in ("cash", "airbnb", "monobank", "stripe"):
+        return None
+    try:
+        parts = [s.strip() for s in
+                 (pf.get("dates") or "").replace(" to ", "|").split("|")]
+        if len(parts) != 2:
+            return None
+        ci, co = date.fromisoformat(parts[0]), date.fromisoformat(parts[1])
+        houses = [h for h in props if pf.get(f"h_{h}") == "on"]
+        if not houses:
+            return None
+        bookings = {h: int(pf.get(f"g_{h}") or props[h]["base_cap"]) for h in houses}
+        q = quote(ci, co, bookings,
+                  jacuzzi_uses=int(pf.get("jacuzzi") or 0),
+                  pets=int(pf.get("pets") or 0),
+                  booking_type=btype,
+                  event=pf.get("event") in ("on", "1", "true"),
+                  event_guests=int(pf.get("event_guests") or 0))
+        return None if q.errors else q
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def _render_edit_screen(props, b, pf, admin_key, kp, msg, price_warning, confirm_rm):
+    """One page, three sections: stay, price, payments.
+
+    Everything about a reservation is editable here — the pricing controls are
+    always visible rather than hidden behind a disclosure, which is what made an
+    unpriced block look unpriceable.
+    """
+    def v(k, d=""):
+        return html_esc(str(pf.get(k, d)))
+
+    sec = ('style="border:1px solid #333c36;border-radius:6px;padding:14px 16px;'
+           'margin-bottom:16px"')
+    lg = ('style="font:11px Verdana,sans-serif;text-transform:uppercase;'
+          'letter-spacing:.12em;color:var(--accent);padding:0 6px"')
+
+    # --- 1. STAY -----------------------------------------------------------
+    house_checks, guest_inputs = "", ""
+    for h, hp in props.items():
+        ck = " checked" if pf.get(f"h_{h}") == "on" else ""
+        house_checks += (f'<label style="margin-right:16px">'
+                         f'<input type="checkbox" name="h_{h}"{ck}> '
+                         f'{html_esc(hp["name"])}</label>')
+        gv = html_esc(str(pf.get(f"g_{h}", hp["base_cap"])))
+        guest_inputs += (f'<label style="margin-right:12px">{html_esc(hp["name"])} '
+                         f'<input type="number" name="g_{h}" min="1" '
+                         f'max="{hp["max_guests"]}" value="{gv}" style="width:50px">'
+                         f'</label>')
+    ev_chk = " checked" if pf.get("event") in ("on", "1", "true") else ""
+    stay = (
+        f'<fieldset {sec}><legend {lg}>1 · Stay</legend>'
+        f'<div class="row"><label>Dates <input type="text" id="admin_dates" '
+        f'name="dates" value="{v("dates")}" required style="min-width:240px">'
+        f'</label></div>'
+        f'<div class="row" style="margin-top:10px">{house_checks}</div>'
+        f'<div class="row" style="margin-top:10px">{guest_inputs}</div>'
+        f'<div class="row" style="margin-top:10px">'
+        f'<label>Jacuzzi uses <input type="number" name="jacuzzi" min="0" '
+        f'value="{v("jacuzzi", "0")}" style="width:60px"></label>'
+        f'<label>Pets <input type="number" name="pets" min="0" '
+        f'value="{v("pets", "0")}" style="width:60px"></label>'
+        f'<label>Event <input type="checkbox" name="event"{ev_chk}></label>'
+        f'<label>Event guests <input type="number" name="event_guests" min="0" '
+        f'value="{v("event_guests", "0")}" style="width:60px"></label></div>'
+        f'<div class="row" style="margin-top:10px">'
+        f'<label>Guest / reason <input type="text" name="label" value="{v("label")}" '
+        f'required style="min-width:260px"></label></div>'
+        f'<label style="display:block;margin-top:10px">'
+        f'<span style="display:block;color:var(--dim);font:12px Verdana;'
+        f'margin-bottom:4px">Notes</span>'
+        f'<textarea name="notes" rows="3" style="width:100%;max-width:420px;'
+        f'box-sizing:border-box;background:var(--bg);color:var(--ink);'
+        f'border:1px solid #333c36;border-radius:4px;padding:6px 8px;'
+        f'font:12px Verdana,sans-serif;resize:vertical">{v("notes")}</textarea>'
+        f'</label></fieldset>'
+    )
+
+    # --- 2. PRICE ----------------------------------------------------------
+    btype_opts = ""
+    for bt_id, bt_lbl in [("", "No pricing"), ("cash", "Cash"),
+                          ("airbnb", "Airbnb (15.5%)"),
+                          ("monobank", "Site — UA card (1.3%)"),
+                          ("stripe", "Site — Int'l card (5.5%)")]:
+        selm = " selected" if pf.get("btype", "") == bt_id else ""
+        btype_opts += f'<option value="{bt_id}"{selm}>{bt_lbl}</option>'
+    live = _quote_for_prefill(pf, props)
+    if live:
+        calc_line = (f'Calculated price: <b>${live.subtotal:,.2f}</b>'
+                     f'<span style="color:var(--dim);font-size:12px"> for the inputs '
+                     f'above</span>')
+        final_default = pf.get("final_price") or f"{live.subtotal:.2f}"
+    else:
+        calc_line = ('<span style="color:var(--dim)">Choose a booking type above to '
+                     'calculate a price for this stay.</span>')
+        final_default = pf.get("final_price", "")
+    is_custom = b.get("override_subtotal") is not None
+    revert = ""
+    if is_custom:
+        revert = (f'<a href="/admin?tab=block&action=revert_price'
+                  f'&block_id={urllib.parse.quote(b["sk"], safe="")}{kp}" '
+                  f'class="btn-sec" style="margin-left:8px">Revert to calculated</a>')
+    price = (
+        f'<fieldset {sec}><legend {lg}>2 · Price</legend>'
+        f'<div class="row"><label>Booking type '
+        f'<select name="btype">{btype_opts}</select></label></div>'
+        f'<p style="margin:10px 0 6px;font:13px Verdana,sans-serif">{calc_line}</p>'
+        f'<div class="row" style="align-items:flex-end">'
+        f'<label>Final price ($) <input type="number" name="final_price" min="0" '
+        f'step="0.01" value="{html_esc(str(final_default))}" style="width:110px">'
+        f'</label>'
+        f'<label>Reason <input type="text" name="price_note" '
+        f'value="{v("price_note")}" placeholder="e.g. friend discount" '
+        f'style="min-width:200px"></label>{revert}</div>'
+        f'<p style="color:var(--dim);font-size:11px;font-family:Verdana;'
+        f'margin:8px 0 0">Leave the final price equal to the calculated price for no '
+        f'override. Cleaning is a fixed cost and is never discounted.</p>'
+        f'</fieldset>'
+    )
+
+    # --- 3. PAYMENTS -------------------------------------------------------
+    rows = ""
+    bid = urllib.parse.quote(b["sk"], safe="")
+    for p in _payments_of(b):
+        pid = p.get("id", "")
+        note = (p.get("note") or "").strip()
+        if confirm_rm and confirm_rm == pid:
+            rm = (f'<a href="/admin?tab=block&action=remove_payment&block_id={bid}'
+                  f'&payment_id={urllib.parse.quote(pid, safe="")}&back=edit{kp}" '
+                  f'style="color:var(--err);font-size:11px">confirm remove</a>')
+        else:
+            rm = (f'<a href="/admin?tab=block&edit_id={bid}'
+                  f'&confirm_rm={urllib.parse.quote(pid, safe="")}{kp}" '
+                  f'style="color:var(--dim);font-size:11px">remove</a>')
+        rows += (f'<li style="margin-bottom:3px">{html_esc(p.get("date",""))} — '
+                 f'<b>{_money(float(p.get("amount") or 0))}</b>'
+                 f'{(" — " + html_esc(note)) if note else ""} &nbsp;{rm}</li>')
+    listing = (f'<ul style="padding-left:18px;margin:0 0 10px;'
+               f'font:12px/1.6 Verdana,sans-serif">{rows}</ul>') if rows else (
+        '<p style="color:var(--dim);font-size:12px;margin:0 0 10px">'
+        'No payments recorded.</p>')
+    received, outstanding, overpaid, _pr = _payment_state(b)
+    if outstanding is None:
+        tot = (f'Received: <b>{_money(received)}</b> &nbsp;·&nbsp; '
+               f'Outstanding: <span style="color:var(--dim)">— (unpriced)</span>')
+    elif overpaid:
+        tot = (f'Received: <b>{_money(received)}</b> &nbsp;·&nbsp; '
+               f'Outstanding: $0.00 <span style="color:var(--err)">(overpaid)</span>')
+    else:
+        tot = (f'Received: <b>{_money(received)}</b> &nbsp;·&nbsp; '
+               f'Outstanding: <b>{_money(outstanding)}</b>')
+    payments = (
+        f'<fieldset {sec}><legend {lg}>3 · Payments</legend>'
+        f'{listing}'
+        f'<div class="row" style="align-items:flex-end">'
+        f'<label>Add payment ($) <input type="number" name="pay_amount" step="0.01" '
+        f'style="width:110px"></label>'
+        f'<label>Date <input type="date" name="pay_date" '
+        f'value="{date.today().isoformat()}" style="width:150px"></label>'
+        f'<label>Note <input type="text" name="pay_note" placeholder="optional" '
+        f'style="min-width:150px"></label></div>'
+        f'<p style="margin:10px 0 0;font:13px Verdana,sans-serif">{tot}</p>'
+        f'<p style="color:var(--dim);font-size:11px;font-family:Verdana;'
+        f'margin:6px 0 0">Totals update when you save.</p>'
+        f'</fieldset>'
+    )
+
+    if msg or price_warning:
+        colour = "var(--err)" if msg.lower().startswith(("error", "conflict")) else "var(--ok)"
+        banner = '<div class="result" style="margin-bottom:16px">'
+        if msg:
+            banner += f'<p style="margin:0;color:{colour}">{html_esc(msg)}</p>'
+        if price_warning:
+            banner += (f'<p style="margin:6px 0 0;color:var(--accent);font-size:12px">'
+                       f'{html_esc(price_warning)}</p>')
+        banner += '</div>'
+    else:
+        banner = ""
+
+    back = f'/admin?tab=block&details={bid}{kp}'
+    key_hidden = (f'<input type="hidden" name="key" value="{html_esc(admin_key)}">'
+                  if admin_key else "")
+    return (
+        f'<h2 style="font:16px Verdana,sans-serif;margin:0 0 4px">Edit reservation</h2>'
+        f'<p style="color:var(--dim);font-size:12px;margin:0 0 16px">'
+        f'{html_esc(b.get("label","?"))} · everything about this booking in one place</p>'
+        f'{banner}'
+        f'<form method="get" action="/admin">'
+        f'<input type="hidden" name="tab" value="block">'
+        f'<input type="hidden" name="action" value="add_block">'
+        f'<input type="hidden" name="edit_id" value="{html_esc(b["sk"])}">'
+        f'{key_hidden}'
+        f'{stay}{price}{payments}'
+        f'<button type="submit">Save reservation</button>'
+        f'<a href="{html_esc(back)}" class="btn-sec" style="margin-left:10px">Cancel</a>'
+        f'</form>'
+    )
+
+
 def _payments_section(b, kp, confirm_remove=""):
     """Ledger list + inline add form for the details view (admin-only, like its caller)."""
     key_hidden = (f'<input type="hidden" name="key" value="{html_esc(kp[5:])}">'
@@ -770,7 +1010,7 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
                  tab="block", q=None, price_error=None, price_params=None,
                  avail=None, block_url=None, month_str="", detail_block=None,
                  confirm_cancel=False, price_warning="", confirm_rm="",
-                 qs_bonus=None):
+                 qs_bonus=None, edit_target=None):
     qs_bonus = qs_bonus or {}
     pf = prefill or {}
     kp = f"&key={admin_key}" if admin_key else ""
@@ -941,6 +1181,14 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
             f'<div class="result">{priced_html}{unpriced_html}{totals_html}</div>'
         )
 
+    elif tab == "block" and prefill and (prefill.get("edit_id") or "").strip() \
+            and edit_target is not None:
+        main_content = _render_edit_screen(
+            props, edit_target,
+            _edit_prefill(edit_target, props, prefill),
+            admin_key, kp, msg, price_warning, confirm_rm,
+        )
+
     else:
         # BLOCK tab
         if month_str:
@@ -989,26 +1237,7 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
             edit_parts = [
                 "tab=block",
                 f"edit_id={urllib.parse.quote(b['sk'], safe='')}",
-                f"dates={urllib.parse.quote(b['checkin'] + ' to ' + b['checkout'], safe='')}",
             ]
-            for h in b.get("houses", []):
-                edit_parts.append(f"h_{h}=on")
-            edit_parts.append(f"label={urllib.parse.quote(b.get('label', ''), safe='')}")
-            if b.get("notes"):
-                edit_parts.append(f"notes={urllib.parse.quote(b['notes'], safe='')}")
-            if b.get("btype"):
-                edit_parts.append(f"btype={urllib.parse.quote(b['btype'], safe='')}")
-                qp = b.get("quote_params") or {}
-                for h2 in props:
-                    if isinstance(qp.get("houses"), dict) and h2 in qp["houses"]:
-                        edit_parts.append(f"g_{h2}={qp['houses'][h2]}")
-                if qp.get("jacuzzi"):
-                    edit_parts.append(f"jacuzzi={qp['jacuzzi']}")
-                if qp.get("pets"):
-                    edit_parts.append(f"pets={qp['pets']}")
-                if qp.get("event"):
-                    edit_parts.append("event=on")
-                    edit_parts.append(f"event_guests={qp.get('event_guests', 0)}")
             if admin_key:
                 edit_parts.append(f"key={urllib.parse.quote(admin_key, safe='')}")
             edit_url = "/admin?" + "&".join(edit_parts)
@@ -1091,7 +1320,6 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
                     f'<br>Gross profit: ${gross_profit:,.2f} &nbsp;·&nbsp; '
                     f'<span class="bonus">Anya\'s bonus (20%): ${bonus:,.2f}</span>'
                     f'</div>'
-                    f'{_price_override_form(b, snap, subtotal, is_custom, kp)}'
                 )
                 # Quote params summary
                 qp = b.get("quote_params") or {}
@@ -1455,7 +1683,19 @@ def _lambda_handler(event, context):
                 # Read off the block being edited, not the URL: the override and its
                 # note belong to the booking, not to whatever the form posted.
                 ov_in, price_note = 0.0, ""
-                if edit_id:
+                if "final_price" in qs:
+                    # Unified Edit screen: the form is authoritative. A final price
+                    # equal to the calculated one means "no override" — that is how
+                    # an override is cleared without a separate revert.
+                    price_note = qs.get("price_note", "").strip()
+                    try:
+                        _fin = float(qs.get("final_price") or 0)
+                    except ValueError:
+                        _fin = 0.0
+                    _calc = float((snapshot or {}).get("subtotal") or 0)
+                    if _fin and snapshot and abs(_fin - _calc) > 0.005:
+                        ov_in = _fin
+                elif edit_id:
                     for _ob in _get_store().list_blocks():
                         if _ob.get("sk") == edit_id:
                             ov_in = float(_ob.get("override_subtotal") or 0)
@@ -1486,12 +1726,25 @@ def _lambda_handler(event, context):
                             carry_payments = [dict(p) for p in _payments_of(_ob)]
                             break
                 if deposit:
-                    # On add this is payment #1; on edit it is an extra payment taken
-                    # in the same submit. Either way it only reaches the store via
-                    # add_block, which rejects on conflict before writing anything —
-                    # so a conflicting save persists neither the block nor the payment.
+                    # Add form only: this is payment #1 for a brand-new booking.
                     carry_payments.append(_new_payment(
                         deposit, date.today().isoformat(), "downpayment"))
+                try:
+                    pay_amt = float(qs.get("pay_amount", "") or 0)
+                except ValueError:
+                    pay_amt = 0.0
+                if pay_amt:
+                    # Entered in the Payments section of the Edit screen. It reaches
+                    # the store only via add_block, which rejects on conflict before
+                    # writing anything — so a conflicting save persists neither the
+                    # block nor the payment.
+                    _pd = (qs.get("pay_date") or "").strip() or date.today().isoformat()
+                    try:
+                        date.fromisoformat(_pd)
+                    except ValueError:
+                        _pd = date.today().isoformat()
+                    carry_payments.append(_new_payment(
+                        pay_amt, _pd, qs.get("pay_note", "").strip()))
 
                 r = _get_store().add_block(
                     houses, ci, co, label,
@@ -1559,7 +1812,11 @@ def _lambda_handler(event, context):
                         _get_store().set_payments(block_id, ledger)
                         msg = f"Payment of ${amt:,.2f} recorded."
             tab = "block"
-            if not qs.get("details"):
+            if qs.get("back") == "edit":
+                qs = dict(qs, edit_id=block_id)
+                prefill = dict(qs)
+                action = ""
+            elif not qs.get("details"):
                 qs = dict(qs, details=block_id)
 
         elif action in ("set_price", "revert_price"):
@@ -1598,7 +1855,11 @@ def _lambda_handler(event, context):
                     )
                     msg = f"Price set to ${new_price:,.2f}."
             tab = "block"
-            if not qs.get("details"):
+            if qs.get("back") == "edit" or action == "revert_price":
+                qs = dict(qs, edit_id=block_id)
+                prefill = dict(qs)
+                action = ""
+            elif not qs.get("details"):
                 qs = dict(qs, details=block_id)
 
         elif action == "cancel_block":
@@ -1658,6 +1919,15 @@ def _lambda_handler(event, context):
         except Exception:
             blocks = []
 
+        # Resolve the block being edited (drives the unified Edit screen)
+        edit_target = None
+        _eid = (qs.get("edit_id") or "").strip()
+        if _eid and tab == "block":
+            for b in blocks:
+                if b.get("sk") == _eid and b.get("status") == "active":
+                    edit_target = b
+                    break
+
         # Resolve detail block (block tab only)
         detail_block = None
         detail_id = qs.get("details", "")
@@ -1676,6 +1946,7 @@ def _lambda_handler(event, context):
             month_str=month_str, detail_block=detail_block,
             confirm_cancel=confirm_cancel, price_warning=price_warning,
             confirm_rm=qs.get("confirm_rm", ""), qs_bonus=dict(qs),
+            edit_target=edit_target,
         ))
         if via_key:
             resp["cookies"] = [_admin_cookie()]
