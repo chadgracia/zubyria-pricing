@@ -39,7 +39,8 @@ class FakeStore:
 
     def add_block(self, houses, checkin, checkout, label, created_by="admin",
                   exclude_id=None, snapshot=None, quote_params=None, btype=None,
-                  notes=None, deposit=None, override_subtotal=None, price_note=None):
+                  notes=None, deposit=None, override_subtotal=None, price_note=None,
+                  payments=None):
         ci_d = checkin if isinstance(checkin, date) else date.fromisoformat(str(checkin))
         co_d = checkout if isinstance(checkout, date) else date.fromisoformat(str(checkout))
         conflicts = []
@@ -78,12 +79,19 @@ class FakeStore:
             item["notes"] = notes
         if deposit:
             item["deposit"] = deposit
+        if payments is not None:
+            item["payments"] = payments
         if override_subtotal:
             item["override_subtotal"] = override_subtotal
         if price_note:
             item["price_note"] = price_note
         self._blocks.append(item)
         return {"ok": True}
+
+    def set_payments(self, block_id, payments):
+        for b in self._blocks:
+            if b.get("sk") == block_id:
+                b["payments"] = payments
 
     def set_price_override(self, block_id, snapshot, override_subtotal, price_note):
         for b in self._blocks:
@@ -413,15 +421,28 @@ _store_at4 = FakeStore([
         "snapshot": {"subtotal": 300.0, "gross_profit": 250.0, "bonus": 50.0},
     },
 ])
+# Cash basis: give each block a payment so it lands in a quarter.
+for _b, _pd in (("block#bon1", "2026-08-05"), ("block#bon2", "2026-08-12"),
+                ("block#bon3", "2026-08-20"), ("block#bon4", "2026-11-01")):
+    for _blk in _store_at4._blocks:
+        if _blk["sk"] == _b:
+            _amt = (_blk.get("snapshot") or {}).get("subtotal", 120.0)
+            _blk["payments"] = [{"id": _b, "date": _pd, "amount": _amt, "note": ""}]
 lambda_function._store = _store_at4
-r = lambda_function.lambda_handler(ev("/admin", {"key": ADMIN_SECRET, "tab": "bonus", "month": "2026-08"}), None)
+r = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "bonus", "q": "3", "year": "2026"}), None)
 body = r["body"]
 t("AT4: BONUS tab renders 200", r["statusCode"] == 200)
 t("AT4: revenue block shown", "Revenue Block" in body)
-t("AT4: total bonus 100.00", "100.00" in body)
+t("AT4: bonus due 100.00 for the quarter", "100.00" in body)
 t("AT4: unpriced block listed", "Maintenance Block" in body)
-t("AT4: cancelled block absent", "Cancelled Revenue" not in body)
-t("AT4: different-month block absent", "Different Month Block" not in body)
+t("AT4: unpriced flagged as not computable", "bonus not computable" in body)
+t("AT4: cancelled block's payment still counted", "Cancelled Revenue" in body)
+t("AT4: cancelled block tagged as such", "cancelled</span>" in body)
+t("AT4: out-of-quarter block absent", "Different Month Block" not in body)
+t("AT4: Q4 shows only the out-of-quarter block",
+  "Different Month Block" in lambda_function.lambda_handler(ev("/admin", {
+      "key": ADMIN_SECRET, "tab": "bonus", "q": "4", "year": "2026"}), None)["body"])
 
 # AT5 – Events: 500 + 10x30 = 800 added to rental_price; event_min_days enforcement
 from pricing_engine import quote as pe_quote
@@ -978,13 +999,17 @@ _store_nd3 = FakeStore([{
 lambda_function._store = _store_nd3
 body_nd3 = lambda_function.lambda_handler(ev("/admin", {
     "key": ADMIN_SECRET, "tab": "block", "details": "block#nd3"}), None)["body"]
-t("AT_nd3: details shows the downpayment", "Downpayment: $500.00" in body_nd3)
-t("AT_nd3: details shows remaining 3100", "Remaining: $3,100.00" in body_nd3)
+t("AT_nd3: details shows money received", "Received: $500.00" in body_nd3)
+t("AT_nd3: legacy deposit migrated into the ledger",
+  "downpayment (migrated)" in body_nd3)
+t("AT_nd3: details shows outstanding 3100", "Outstanding: $3,100.00" in body_nd3)
 body_nd3b = lambda_function.lambda_handler(ev("/admin", {
-    "key": ADMIN_SECRET, "tab": "bonus", "month": "2026-09"}), None)["body"]
-t("AT_nd3: BONUS tab has a paid/remaining column", "Paid / remaining" in body_nd3b)
-t("AT_nd3: BONUS row shows paid and remaining", "$500.00 / $3,100.00" in body_nd3b)
-t("AT_nd3: bonus value unaffected by the deposit", "$600.00" in body_nd3b)
+    "key": ADMIN_SECRET, "tab": "bonus", "q": "3", "year": "2026"}), None)["body"]
+t("AT_nd3: migrated deposit appears as a payment in its quarter",
+  "Deposit Guest" in body_nd3b)
+t("AT_nd3: BONUS tab reports money received", "Received:" in body_nd3b)
+t("AT_nd3: bonus accrues pro-rata on the 500 received",
+  f"${round(500.0 * (600.0 / 3600.0), 2):,.2f}" in body_nd3b)
 
 # AT_nd4 – deposit with no snapshot → unpriced dash, no fabricated remaining
 _store_nd4 = FakeStore([{
@@ -996,8 +1021,8 @@ _store_nd4 = FakeStore([{
 lambda_function._store = _store_nd4
 body_nd4 = lambda_function.lambda_handler(ev("/admin", {
     "key": ADMIN_SECRET, "tab": "block", "details": "block#nd4"}), None)["body"]
-t("AT_nd4: unpriced block still shows the deposit", "Downpayment: $250.00" in body_nd4)
-t("AT_nd4: unpriced block shows the remaining dash", "— (unpriced)" in body_nd4)
+t("AT_nd4: unpriced block still shows money received", "Received: $250.00" in body_nd4)
+t("AT_nd4: unpriced block shows the outstanding dash", "— (unpriced)" in body_nd4)
 t("AT_nd4: unpriced block still says no pricing recorded", "No pricing recorded" in body_nd4)
 
 # AT_nd5 – deposit greater than subtotal is flagged as an overpayment
@@ -1013,25 +1038,31 @@ body_nd5 = lambda_function.lambda_handler(ev("/admin", {
     "key": ADMIN_SECRET, "tab": "block", "details": "block#nd5"}), None)["body"]
 t("AT_nd5: overpayment flagged", "overpaid by $200.00" in body_nd5)
 t("AT_nd5: overpayment uses the --err colour", "var(--err)" in body_nd5)
-t("AT_nd5: remaining clamped at zero", "Remaining: $0.00" in body_nd5)
+t("AT_nd5: outstanding clamped at zero", "Outstanding: $0.00" in body_nd5)
 
-# AT_nd6 – deposits never move Anya's bonus (bonus is on gross profit, not cash)
+# AT_nd6 – cash basis: bonus accrues as money arrives; the booking's full bonus
+# is unchanged by how it was paid (bonus is on gross profit, not on cash).
 _paid = {
     "pk": "blocks", "sk": "block#nd6a",
     "houses": ["tseglina"], "checkin": "2026-09-10", "checkout": "2026-09-13",
     "label": "Fully Paid", "created_by": "admin", "status": "active",
     "btype": "cash", "snapshot": {"subtotal": 1000.0, "gross_profit": 800.0, "bonus": 160.0},
 }
-lambda_function._store = FakeStore([dict(_paid)])
-_no_dep = lambda_function.lambda_handler(ev("/admin", {
-    "key": ADMIN_SECRET, "tab": "bonus", "month": "2026-09"}), None)["body"]
-lambda_function._store = FakeStore([dict(_paid, deposit=1000.0)])
-_with_dep = lambda_function.lambda_handler(ev("/admin", {
-    "key": ADMIN_SECRET, "tab": "bonus", "month": "2026-09"}), None)["body"]
-t("AT_nd6: total bonus identical with and without a deposit",
-  _re.search(r"Total bonus</td>.*?\$([\d,.]+)", _no_dep, _re.S).group(1)
-  == _re.search(r"Total bonus</td>.*?\$([\d,.]+)", _with_dep, _re.S).group(1))
-t("AT_nd6: fully paid row reads 'paid'", "$1,000.00 / paid" in _with_dep)
+lambda_function._store = FakeStore([dict(_paid, payments=[
+    {"id": "p1", "date": "2026-09-15", "amount": 400.0, "note": ""}])])
+_part = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "bonus", "q": "3", "year": "2026"}), None)["body"]
+lambda_function._store = FakeStore([dict(_paid, payments=[
+    {"id": "p1", "date": "2026-09-15", "amount": 1000.0, "note": ""}])])
+_full = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "bonus", "q": "3", "year": "2026"}), None)["body"]
+t("AT_nd6: part payment accrues a proportional bonus (400 -> 64.00)",
+  "$64.00" in _part)
+t("AT_nd6: full payment accrues the whole bonus (1000 -> 160.00)",
+  "$160.00" in _full)
+t("AT_nd6: bonus due tracks cash, not the booking total",
+  "BONUS DUE" in _part and "$160.00" not in _part.split("BONUS DUE")[1])
+t("AT_nd6: full amount shown as received", "Received: <b>$1,000.00</b>" in _full)
 
 # AT_nd7 – chart marks bars with a balance still owing; paid/unpriced stay unmarked
 _store_nd7 = FakeStore([
@@ -1186,17 +1217,19 @@ _set_price(_store_ov5b, 200)
 t("AT_ov5: override equal to cleaning is accepted",
   _store_ov5b._blocks[0]["snapshot"]["override_subtotal"] == 200.0)
 
-# AT_ov6 – BONUS tab uses the effective bonus and marks the row custom
+# AT_ov6 – an override changes the bonus ratio, so cash accrues at the new rate
 _store_ov6 = FakeStore([_ov_block()])
 _set_price(_store_ov6, 3000)
+_store_ov6.set_payments("block#ov", [
+    {"id": "p1", "date": "2026-09-15", "amount": 3000.0, "note": ""}])
 lambda_function._store = _store_ov6
 body_ov6 = lambda_function.lambda_handler(ev("/admin", {
-    "key": ADMIN_SECRET, "tab": "bonus", "month": "2026-09"}), None)["body"]
-t("AT_ov6: BONUS row shows the overridden price", "$3,000.00" in body_ov6)
+    "key": ADMIN_SECRET, "tab": "bonus", "q": "3", "year": "2026"}), None)["body"]
+t("AT_ov6: BONUS row shows the payment", "$3,000.00" in body_ov6)
 t("AT_ov6: BONUS row carries a custom marker", "custom</span>" in body_ov6)
-t("AT_ov6: BONUS total uses the overridden bonus",
-  _re.search(r"Total bonus</td>.*?\$467\.00", body_ov6, _re.S) is not None)
-t("AT_ov6: original bonus not used in the total", "$568.40" not in body_ov6)
+t("AT_ov6: paying the overridden total accrues the overridden bonus",
+  "$467.00" in body_ov6)
+t("AT_ov6: pre-override bonus not used", "$568.40" not in body_ov6)
 
 # AT_ov7 – Remaining is measured against the override, not the computed price
 _store_ov7 = FakeStore([_ov_block(deposit=500.0)])
@@ -1204,8 +1237,8 @@ _set_price(_store_ov7, 3000)
 lambda_function._store = _store_ov7
 body_ov7 = lambda_function.lambda_handler(ev("/admin", {
     "key": ADMIN_SECRET, "tab": "block", "details": "block#ov"}), None)["body"]
-t("AT_ov7: remaining uses the override (3000-500)", "Remaining: $2,500.00" in body_ov7)
-t("AT_ov7: remaining does not use the computed price", "Remaining: $3,100.00" not in body_ov7)
+t("AT_ov7: outstanding uses the override (3000-500)", "Outstanding: $2,500.00" in body_ov7)
+t("AT_ov7: outstanding does not use the computed price", "Outstanding: $3,100.00" not in body_ov7)
 
 # AT_ov8 – editing dates keeps the override amount, re-derives it, and warns
 _store_ov8 = FakeStore([_ov_block()])
@@ -1287,6 +1320,222 @@ r_ov10s = lambda_function.lambda_handler(ev("/admin", {
 t("AT_ov10: non-admin cannot set a price",
   "Access denied" in r_ov10s["body"]
   and _store_ov7._blocks[0]["snapshot"]["subtotal"] == 3000.0)
+
+# ── AT_pl: payment ledger + quarterly cash-basis bonus ───────────────────────
+
+print("\n=== Payment ledger / quarterly bonus tests ===")
+
+# 3625 subtotal, 568.40 bonus → ratio 0.15680; 1000 → 156.80, 2625 → 411.60
+_PL_SNAP = {"subtotal": 3625.0, "gross_profit": 2842.0, "bonus": 568.40,
+            "cleaning_total": 200.0, "rental_price": 3425.0}
+
+def _pl_block(payments, **kw):
+    b = {
+        "pk": "blocks", "sk": "block#pl", "houses": ["tseglina"],
+        "checkin": "2026-09-10", "checkout": "2026-09-13", "label": "Ledger Guest",
+        "created_by": "admin", "created_at": "2026-08-01T10:00:00",
+        "status": "active", "btype": "cash", "snapshot": dict(_PL_SNAP),
+        "payments": payments,
+    }
+    b.update(kw)
+    return b
+
+def _q(store, q, year=2026):
+    lambda_function._store = store
+    return lambda_function.lambda_handler(ev("/admin", {
+        "key": ADMIN_SECRET, "tab": "bonus", "q": str(q), "year": str(year)}), None)["body"]
+
+# AT_pl1 – two payments in Q4 2026 → received 3625, bonus due 568.40
+_two = [{"id": "a", "date": "2026-10-05", "amount": 1000.0, "note": "deposit"},
+        {"id": "b", "date": "2026-11-20", "amount": 2625.0, "note": "balance"}]
+_store_pl1 = FakeStore([_pl_block(_two)])
+body_pl1 = _q(_store_pl1, 4)
+t("AT_pl1: Q4 received totals 3625", "Received: <b>$3,625.00</b>" in body_pl1)
+t("AT_pl1: Q4 bonus due totals 568.40", "BONUS DUE: <b>$568.40</b>" in body_pl1)
+t("AT_pl1: both payments listed", "2026-10-05" in body_pl1 and "2026-11-20" in body_pl1)
+t("AT_pl1: payments grouped under one booking", body_pl1.count("Ledger Guest") == 1)
+t("AT_pl1: first payment accrues 156.80", "$156.80" in body_pl1)
+t("AT_pl1: second payment accrues 411.60", "$411.60" in body_pl1)
+
+# AT_pl2 – a single 1000 payment accrues 156.80 and leaves a balance
+_store_pl2 = FakeStore([_pl_block([_two[0]])])
+body_pl2 = _q(_store_pl2, 4)
+t("AT_pl2: single payment accrues 156.80", "$156.80" in body_pl2)
+t("AT_pl2: bonus due is only what was received", "BONUS DUE: <b>$156.80</b>" in body_pl2)
+_rec, _out, _over, _pr = lambda_function._payment_state(_pl_block([_two[0]]))
+t("AT_pl2: received reads from the ledger", _rec == 1000.0)
+t("AT_pl2: outstanding is subtotal minus received", _out == 2625.0)
+
+# AT_pl3 – a payment dated Q1 2027 appears only in that quarter
+_store_pl3 = FakeStore([_pl_block(
+    _two + [{"id": "c", "date": "2027-02-10", "amount": 500.0, "note": "late"}])])
+t("AT_pl3: Q1-2027 payment absent from Q4-2026", "2027-02-10" not in _q(_store_pl3, 4))
+_body_q1 = _q(_store_pl3, 1, 2027)
+t("AT_pl3: Q1-2027 payment present in its own quarter", "2027-02-10" in _body_q1)
+t("AT_pl3: Q1-2027 shows only that payment", "2026-10-05" not in _body_q1)
+t("AT_pl3: Q1-2027 totals only that payment", "Received: <b>$500.00</b>" in _body_q1)
+
+# AT_pl4 – legacy deposit migrates to payment #1, totals intact
+_legacy = {
+    "pk": "blocks", "sk": "block#leg", "houses": ["tseglina"],
+    "checkin": "2026-09-10", "checkout": "2026-09-13", "label": "Legacy Guest",
+    "created_by": "admin", "created_at": "2026-10-02T09:00:00", "status": "active",
+    "btype": "cash", "snapshot": dict(_PL_SNAP), "deposit": 1000.0,
+}
+_mig = lambda_function._payments_of(_legacy)
+t("AT_pl4: legacy deposit becomes exactly one payment", len(_mig) == 1)
+t("AT_pl4: migrated amount preserved", _mig[0]["amount"] == 1000.0)
+t("AT_pl4: migrated date comes from created_at", _mig[0]["date"] == "2026-10-02")
+t("AT_pl4: migrated payment is labelled", _mig[0]["note"] == "downpayment (migrated)")
+t("AT_pl4: received matches the legacy deposit",
+  lambda_function._payment_state(_legacy)[0] == 1000.0)
+t("AT_pl4: migrated payment lands in its quarter",
+  "$156.80" in _q(FakeStore([_legacy]), 4))
+t("AT_pl4: a real ledger makes deposit ignored",
+  lambda_function._payment_state(dict(_legacy, payments=[]))[0] == 0.0)
+
+# AT_pl5 – a stay edit carries both payments onto the RECREATED item
+_store_pl5 = FakeStore([_pl_block(_two)])
+lambda_function._store = _store_pl5
+r_pl5 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "action": "add_block",
+    "edit_id": "block#pl", "dates": "2026-09-20 to 2026-09-24",
+    "h_tseglina": "on", "label": "Ledger Guest",
+}), None)
+t("AT_pl5: edit succeeds", "Block updated" in r_pl5["body"])
+_new_pl5 = [b for b in _store_pl5._blocks
+            if b.get("status") == "active" and b.get("checkin") == "2026-09-20"][0]
+t("AT_pl5: both payments carried onto the new item",
+  len(_new_pl5.get("payments", [])) == 2)
+t("AT_pl5: carried amounts intact",
+  sorted(p["amount"] for p in _new_pl5["payments"]) == [1000.0, 2625.0])
+t("AT_pl5: carried notes intact",
+  {p["note"] for p in _new_pl5["payments"]} == {"deposit", "balance"})
+t("AT_pl5: ledger not threaded through the edit URL",
+  "payments=" not in r_pl5["body"] and "amount=" not in r_pl5["body"])
+
+# AT_pl6 – a conflicting edit carrying a new payment writes NOTHING
+_store_pl6 = FakeStore([
+    _pl_block(_two),
+    {"pk": "blocks", "sk": "block#other", "houses": ["tseglina"],
+     "checkin": "2026-09-20", "checkout": "2026-09-25", "label": "Blocker",
+     "created_by": "admin", "status": "active"},
+])
+_before = len(_store_pl6._blocks)
+lambda_function._store = _store_pl6
+r_pl6 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "action": "add_block",
+    "edit_id": "block#pl", "dates": "2026-09-21 to 2026-09-24",
+    "h_tseglina": "on", "label": "Ledger Guest", "deposit": "750",
+}), None)
+t("AT_pl6: conflicting edit rejected naming the blocker",
+  "Conflict" in r_pl6["body"] and "Blocker" in r_pl6["body"])
+t("AT_pl6: no new block written", len(_store_pl6._blocks) == _before)
+_orig_pl6 = [b for b in _store_pl6._blocks if b["sk"] == "block#pl"][0]
+t("AT_pl6: original block still active", _orig_pl6["status"] == "active")
+t("AT_pl6: no payment written on conflict", len(_orig_pl6["payments"]) == 2)
+t("AT_pl6: the submitted 750 was not recorded",
+  all(p["amount"] != 750.0 for p in _orig_pl6["payments"]))
+
+# AT_pl7 – a negative payment (refund) subtracts from both totals
+_store_pl7 = FakeStore([_pl_block(
+    _two + [{"id": "r", "date": "2026-12-01", "amount": -625.0, "note": "refund"}])])
+body_pl7 = _q(_store_pl7, 4)
+t("AT_pl7: refund accepted in the ledger", "refund" in body_pl7)
+t("AT_pl7: refund subtracts from received", "Received: <b>$3,000.00</b>" in body_pl7)
+t("AT_pl7: refund subtracts bonus too", "BONUS DUE: <b>$470.40</b>" in body_pl7)
+t("AT_pl7: refund shown as a negative amount", "-$625.00" in body_pl7)
+
+# AT_pl8 – an override changes the ratio, so the same cash accrues differently
+_store_pl8 = FakeStore([_pl_block([_two[0]])])
+_pre = _q(_store_pl8, 4)
+_store_pl8.set_price_override(
+    "block#pl",
+    lambda_function._apply_override(dict(_PL_SNAP), "cash", 2000.0),
+    2000.0, "discount")
+_post = _q(_store_pl8, 4)
+t("AT_pl8: pre-override 1000 accrues 156.80", "$156.80" in _pre)
+_r8 = lambda_function._bonus_ratio(
+    dict(_pl_block([_two[0]]),
+         snapshot=lambda_function._apply_override(dict(_PL_SNAP), "cash", 2000.0)))
+t("AT_pl8: override raises the bonus ratio", _r8 > 568.40 / 3625)
+t("AT_pl8: same cash now accrues at the new rate",
+  f"${round(1000.0 * _r8, 2):,.2f}" in _post)
+t("AT_pl8: old accrual no longer shown", "$156.80" not in _post)
+
+# AT_pl9 – payments against an unpriced block are listed, not silently dropped
+_store_pl9 = FakeStore([_pl_block(
+    [{"id": "u", "date": "2026-10-08", "amount": 400.0, "note": "holding"}],
+    snapshot=None, sk="block#unp", label="Unpriced Guest")])
+_store_pl9._blocks[0].pop("snapshot", None)
+body_pl9 = _q(_store_pl9, 4)
+t("AT_pl9: unpriced block with payments is listed", "Unpriced Guest" in body_pl9)
+t("AT_pl9: flagged bonus not computable", "bonus not computable" in body_pl9)
+t("AT_pl9: its amount is shown", "$400.00" in body_pl9)
+t("AT_pl9: it contributes no bonus", "BONUS DUE: <b>$0.00</b>" in body_pl9)
+t("AT_pl9: but does count as received", "Received: <b>$400.00</b>" in body_pl9)
+
+# AT_pl10 – add / remove payment from Details, two-step remove, admin only
+_store_pl10 = FakeStore([_pl_block([_two[0]])])
+lambda_function._store = _store_pl10
+r_add = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "action": "add_payment",
+    "block_id": "block#pl", "amount": "2625", "pay_date": "2026-11-20",
+    "pay_note": "balance"}), None)
+t("AT_pl10: add payment reports success", "Payment of $2,625.00 recorded" in r_add["body"])
+t("AT_pl10: ledger now has two payments", len(_store_pl10._blocks[0]["payments"]) == 2)
+t("AT_pl10: details lists the Payments section", ">Payments</h3>" in r_add["body"])
+t("AT_pl10: details shows bonus earned to date", "Bonus earned to date" in r_add["body"])
+_pid = [p["id"] for p in _store_pl10._blocks[0]["payments"] if p["amount"] == 2625.0][0]
+r_rm1 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "details": "block#pl", "confirm_rm": _pid}), None)
+t("AT_pl10: remove needs a confirmation step", "confirm remove" in r_rm1["body"])
+t("AT_pl10: viewing the confirm step removes nothing",
+  len(_store_pl10._blocks[0]["payments"]) == 2)
+r_rm2 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "action": "remove_payment",
+    "block_id": "block#pl", "payment_id": _pid}), None)
+t("AT_pl10: confirmed remove deletes the payment",
+  len(_store_pl10._blocks[0]["payments"]) == 1)
+t("AT_pl10: the right payment was removed",
+  _store_pl10._blocks[0]["payments"][0]["amount"] == 1000.0)
+r_pl10n = lambda_function.lambda_handler(ev("/admin", {
+    "tab": "block", "action": "add_payment", "block_id": "block#pl", "amount": "99"}), None)
+t("AT_pl10: non-admin cannot add a payment",
+  "Access denied" in r_pl10n["body"]
+  and len(_store_pl10._blocks[0]["payments"]) == 1)
+
+# AT_pl11 – downpayment on the add form becomes payment #1, and is Decimal-safe
+_store_pl11 = FakeStore()
+lambda_function._store = _store_pl11
+lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "action": "add_block",
+    "dates": "2026-09-10 to 2026-09-13", "h_tseglina": "on",
+    "label": "New Guest", "deposit": "500"}), None)
+_new11 = _store_pl11._blocks[-1]
+t("AT_pl11: downpayment creates payment #1", len(_new11.get("payments", [])) == 1)
+t("AT_pl11: payment #1 carries the amount", _new11["payments"][0]["amount"] == 500.0)
+t("AT_pl11: payment #1 is labelled downpayment",
+  _new11["payments"][0]["note"] == "downpayment")
+
+_strict_pl = StrictDynamoTable()
+_store_pl12 = Store(_strict_pl)
+_store_pl12.add_block(
+    houses=["tseglina"], checkin=date(2026, 11, 1), checkout=date(2026, 11, 4),
+    label="Ledger decimal", snapshot=dict(_PL_SNAP),
+    payments=[{"id": "x", "date": "2026-11-01", "amount": 1000.5, "note": "n"}])
+_sk_pl = _store_pl12.list_blocks()[0]["sk"]
+_store_pl12.set_payments(_sk_pl, [
+    {"id": "x", "date": "2026-11-01", "amount": 1000.5, "note": "n"},
+    {"id": "y", "date": "2026-11-02", "amount": 24.25, "note": "m"}])
+_read_pl = _store_pl12.list_blocks()[0]
+t("AT_pl11: ledger survives a float-rejecting table",
+  len(_read_pl["payments"]) == 2)
+t("AT_pl11: payment amounts read back as native floats",
+  _read_pl["payments"][0]["amount"] == 1000.5
+  and not isinstance(_read_pl["payments"][0]["amount"], Decimal))
+t("AT_pl11: received sums the stored ledger",
+  lambda_function._payment_state(_read_pl)[0] == 1024.75)
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 print()

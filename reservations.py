@@ -86,7 +86,8 @@ class Store:
 
     def add_block(self, houses, checkin, checkout, label, created_by="admin",
                   exclude_id=None, snapshot=None, quote_params=None, btype=None,
-                  notes=None, deposit=None, override_subtotal=None, price_note=None):
+                  notes=None, deposit=None, override_subtotal=None, price_note=None,
+                  payments=None):
         """Check availability for the given houses (excluding exclude_id block); if any conflict,
         return {"ok": False, "conflicts": [label, ...]} without writing.
         On success write the item and return {"ok": True, "id": sk}."""
@@ -118,8 +119,10 @@ class Store:
         if notes:
             item["notes"] = notes
         if deposit:
-            # _to_dynamo turns the float into a Decimal at the store boundary.
+            # Legacy scalar, kept only so old items still read; the ledger is truth.
             item["deposit"] = deposit
+        if payments is not None:
+            item["payments"] = payments
         if override_subtotal:
             item["override_subtotal"] = override_subtotal
         if price_note:
@@ -152,6 +155,19 @@ class Store:
                     ":pn": price_note or "",
                 }),
             )
+
+    def set_payments(self, block_id, payments):
+        """Replace a block's payment ledger wholesale.
+
+        Callers derive the new list from the current one (append / remove) so a
+        migrated legacy deposit is materialised on the first write.
+        """
+        self._t.update_item(
+            Key={"pk": "BLOCK", "sk": block_id},
+            UpdateExpression="SET #p = :p",
+            ExpressionAttributeNames={"#p": "payments"},
+            ExpressionAttributeValues={":p": _to_dynamo(payments)},
+        )
 
     def cancel_block(self, block_id):
         self._t.update_item(

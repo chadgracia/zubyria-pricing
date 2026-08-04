@@ -91,6 +91,56 @@ def _revert_override(snap):
     return out
 
 
+def _payments_section(b, kp, confirm_remove=""):
+    """Ledger list + inline add form for the details view (admin-only, like its caller)."""
+    key_hidden = (f'<input type="hidden" name="key" value="{html_esc(kp[5:])}">'
+                  if kp else "")
+    bid = urllib.parse.quote(b["sk"], safe="")
+    rows = ""
+    for p in _payments_of(b):
+        pid = p.get("id", "")
+        amt = float(p.get("amount") or 0)
+        note = (p.get("note") or "").strip()
+        # Two-step remove, matching the block-cancel pattern: never single-click.
+        if confirm_remove and confirm_remove == pid:
+            rm = (f'<a href="/admin?tab=block&action=remove_payment'
+                  f'&block_id={bid}&payment_id={urllib.parse.quote(pid, safe="")}{kp}" '
+                  f'style="color:var(--err);font-size:11px">confirm remove</a>')
+        else:
+            rm = (f'<a href="/admin?tab=block&details={bid}'
+                  f'&confirm_rm={urllib.parse.quote(pid, safe="")}{kp}" '
+                  f'style="color:var(--dim);font-size:11px">remove</a>')
+        rows += (
+            f'<li style="margin-bottom:3px">{html_esc(p.get("date",""))} — '
+            f'<b>${amt:,.2f}</b>'
+            f'{(" — " + html_esc(note)) if note else ""} &nbsp;{rm}</li>'
+        )
+    listing = (f'<ul style="padding-left:18px;margin:6px 0 10px;font:12px/1.6 Verdana,'
+               f'sans-serif">{rows}</ul>') if rows else (
+        '<p style="color:var(--dim);font-size:12px;margin:6px 0 10px">'
+        'No payments recorded.</p>')
+    return (
+        f'<div style="margin-top:14px">'
+        f'<h3 style="font:11px Verdana,sans-serif;text-transform:uppercase;'
+        f'letter-spacing:.1em;color:var(--dim);margin:0 0 4px">Payments</h3>'
+        f'{listing}'
+        f'<form method="get" action="/admin">'
+        f'<input type="hidden" name="tab" value="block">'
+        f'<input type="hidden" name="action" value="add_payment">'
+        f'<input type="hidden" name="block_id" value="{html_esc(b["sk"])}">'
+        f'{key_hidden}'
+        f'<div class="row" style="align-items:flex-end">'
+        f'<label>Amount ($) <input type="number" name="amount" step="0.01" '
+        f'style="width:100px"></label>'
+        f'<label>Date <input type="date" name="pay_date" '
+        f'value="{date.today().isoformat()}" style="width:150px"></label>'
+        f'<label>Note <input type="text" name="pay_note" '
+        f'placeholder="optional" style="min-width:150px"></label>'
+        f'<button type="submit">Add payment</button>'
+        f'</div></form></div>'
+    )
+
+
 def _price_override_form(b, snap, subtotal, is_custom, kp):
     """Collapsed 'Edit price' panel for the details view (admin-only, like its caller).
 
@@ -131,20 +181,66 @@ def _price_override_form(b, snap, subtotal, is_custom, kp):
     )
 
 
-def _payment_state(b):
-    """Deposit / remaining for a block. Computed at render time, never stored.
+def _payments_of(b):
+    """The block's payment ledger — the single source of truth for cash received.
 
-    Returns (deposit, remaining, overpaid, priced). remaining is clamped at 0 and is
-    None when the block carries no price snapshot. Anya's bonus is deliberately not
-    involved: it is a share of gross profit, not of cash collected.
+    Legacy blocks carry a single `deposit` scalar and no ledger; those are migrated
+    lazily here into payment #1 so every reader sees one shape. The migration is
+    materialised on the next write; until then `deposit` is only ever read through
+    this function, and once a ledger exists `deposit` is ignored outright.
     """
-    deposit = float(b.get("deposit") or 0)
+    pays = b.get("payments")
+    if isinstance(pays, list):
+        return sorted(pays, key=lambda p: (p.get("date") or "", p.get("id") or ""))
+    dep = float(b.get("deposit") or 0)
+    if dep:
+        return [{
+            "id": "legacy",
+            "date": (b.get("created_at") or b.get("checkin") or "")[:10],
+            "amount": dep,
+            "note": "downpayment (migrated)",
+        }]
+    return []
+
+
+def _new_payment(amount, date_str, note):
+    import uuid
+    return {"id": uuid.uuid4().hex[:10], "date": date_str,
+            "amount": round(float(amount), 2), "note": note or ""}
+
+
+def _effective_subtotal(b):
+    snap = b.get("snapshot")
+    return float(snap.get("subtotal", 0) or 0) if snap else None
+
+
+def _bonus_ratio(b):
+    """Share of each dollar received that is Anya's, override-aware.
+
+    Bonus is still earned on gross profit; this only spreads the already-computed
+    bonus across the money as it actually arrives (cash basis).
+    """
     snap = b.get("snapshot")
     if not snap:
-        return deposit, None, False, False
+        return None
     subtotal = float(snap.get("subtotal", 0) or 0)
-    raw = subtotal - deposit
-    return deposit, max(0.0, raw), raw < 0, True
+    if not subtotal:
+        return None
+    return float(snap.get("bonus", 0) or 0) / subtotal
+
+
+def _payment_state(b):
+    """(received, outstanding, overpaid, priced) from the ledger alone.
+
+    outstanding is clamped at 0 and is None for a block with no price snapshot —
+    money can be recorded against an unpriced block, but a balance cannot be.
+    """
+    received = round(sum(float(p.get("amount") or 0) for p in _payments_of(b)), 2)
+    subtotal = _effective_subtotal(b)
+    if subtotal is None:
+        return received, None, False, False
+    raw = round(subtotal - received, 2)
+    return received, max(0.0, raw), raw < 0, True
 
 
 def _block_color(sk):
@@ -163,6 +259,17 @@ def _next_month_ym(y, m):
     if m == 13:
         return y + 1, 1
     return y, m
+
+
+def _money(x):
+    """Currency with the sign outside the symbol: -$625.00, not $-625.00."""
+    return f"-${abs(x):,.2f}" if x < 0 else f"${x:,.2f}"
+
+
+def _quarter_bounds(y, q):
+    """First and last day of quarter q (1-4) in year y."""
+    start_m = 3 * (q - 1) + 1
+    return date(y, start_m, 1), _month_end(y, start_m + 2)
 
 
 def _month_end(y, m):
@@ -662,7 +769,9 @@ def render_page(props: dict, params=None, q: Quote = None, error=None,
 def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
                  tab="block", q=None, price_error=None, price_params=None,
                  avail=None, block_url=None, month_str="", detail_block=None,
-                 confirm_cancel=False, price_warning=""):
+                 confirm_cancel=False, price_warning="", confirm_rm="",
+                 qs_bonus=None):
+    qs_bonus = qs_bonus or {}
     pf = prefill or {}
     kp = f"&key={admin_key}" if admin_key else ""
     key_hidden = f'<input type="hidden" name="key" value="{html_esc(admin_key)}">' if admin_key else ""
@@ -689,103 +798,147 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
         main_content = price_html
 
     elif tab == "bonus":
-        # Parse month
-        if month_str:
-            try:
-                bonus_month_date = date.fromisoformat(month_str + "-01")
-            except ValueError:
-                bonus_month_date = date.today().replace(day=1)
-        else:
-            bonus_month_date = date.today().replace(day=1)
-        bm_y, bm_m = bonus_month_date.year, bonus_month_date.month
-        month_end_day = _month_end(bm_y, bm_m)
+        # Cash basis: the report is driven by PAYMENTS dated in the quarter, not by
+        # bookings. Bonus is still earned on gross profit — bonus_ratio just spreads
+        # each booking's already-computed bonus across the money as it arrives.
+        today_q = date.today()
+        try:
+            q_sel = int(qs_bonus.get("q") or ((today_q.month - 1) // 3 + 1))
+        except (ValueError, TypeError):
+            q_sel = (today_q.month - 1) // 3 + 1
+        q_sel = min(4, max(1, q_sel))
+        try:
+            y_sel = int(qs_bonus.get("year") or today_q.year)
+        except (ValueError, TypeError):
+            y_sel = today_q.year
+        q_start, q_end = _quarter_bounds(y_sel, q_sel)
+        q_label = f"Q{q_sel} {y_sel}"
 
-        py_b, pm_b = _prev_month(bm_y, bm_m)
-        ny_b, nm_b = _next_month_ym(bm_y, bm_m)
-        month_label_b = bonus_month_date.strftime("%B %Y")
-        bonus_month_nav = (
-            f'<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">'
-            f'<a href="/admin?tab=bonus&month={py_b}-{pm_b:02d}{kp}" class="btn-sec" style="padding:4px 12px">← Prev</a>'
-            f'<span style="font:13px Verdana,sans-serif;color:var(--dim)">{html_esc(month_label_b)}</span>'
-            f'<a href="/admin?tab=bonus&month={ny_b}-{nm_b:02d}{kp}" class="btn-sec" style="padding:4px 12px">Next →</a>'
-            f'</div>'
+        # Collect payments in range, grouped by block. Cancelled blocks are included:
+        # money that changed hands still counts in the quarter it was received.
+        groups, unpriced_groups = [], []
+        total_received = 0.0
+        total_bonus = 0.0
+        for b in sorted(blocks, key=lambda x: (x.get("label") or "")):
+            hits = [p for p in _payments_of(b)
+                    if q_start.isoformat() <= (p.get("date") or "") <= q_end.isoformat()]
+            if not hits:
+                continue
+            ratio = _bonus_ratio(b)
+            got = round(sum(float(p.get("amount") or 0) for p in hits), 2)
+            total_received += got
+            if ratio is None:
+                unpriced_groups.append((b, hits, got))
+            else:
+                earned = round(sum(round(float(p.get("amount") or 0) * ratio, 2)
+                                   for p in hits), 2)
+                total_bonus += earned
+                groups.append((b, hits, got, earned))
+        total_received = round(total_received, 2)
+        total_bonus = round(total_bonus, 2)
+
+        qnav = ""
+        for qi in range(1, 5):
+            on = " active" if qi == q_sel else ""
+            qnav += (f'<a href="/admin?tab=bonus&q={qi}&year={y_sel}{kp}" '
+                     f'class="btn-sec" style="padding:4px 12px'
+                     f'{";border-color:var(--accent);color:var(--accent)" if on else ""}">'
+                     f'Q{qi}</a>')
+        bonus_nav = (
+            f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;'
+            f'flex-wrap:wrap">'
+            f'<a href="/admin?tab=bonus&q={q_sel}&year={y_sel - 1}{kp}" class="btn-sec" '
+            f'style="padding:4px 12px">← {y_sel - 1}</a>'
+            f'<span style="font:13px Verdana,sans-serif;color:var(--dim)">{y_sel}</span>'
+            f'<a href="/admin?tab=bonus&q={q_sel}&year={y_sel + 1}{kp}" class="btn-sec" '
+            f'style="padding:4px 12px">{y_sel + 1} →</a>'
+            f'<span style="width:12px"></span>{qnav}</div>'
         )
 
-        month_start_iso = bonus_month_date.isoformat()
-        month_end_iso = month_end_day.isoformat()
-        month_blocks = [
-            b for b in blocks
-            if b.get("status") == "active"
-            and month_start_iso <= b.get("checkin", "") <= month_end_iso
-        ]
-        priced = [b for b in month_blocks if b.get("snapshot")]
-        unpriced = [b for b in month_blocks if not b.get("snapshot")]
-        total_bonus = sum(b["snapshot"].get("bonus", 0) for b in priced)
+        tbl_s = 'style="border-collapse:collapse;width:100%;font:13px Verdana,sans-serif"'
+        th_s = ('style="text-align:left;padding:8px 12px;border-bottom:1px solid #333c36;'
+                'color:var(--dim);font-size:11px;letter-spacing:.1em;'
+                'text-transform:uppercase"')
+        td_s = 'style="padding:8px 12px;border-bottom:1px solid #2a322d"'
 
-        if priced:
-            tbl_s = 'style="border-collapse:collapse;width:100%;font:13px Verdana,sans-serif"'
-            th_s = 'style="text-align:left;padding:8px 12px;border-bottom:1px solid #333c36;color:var(--dim);font-size:11px;letter-spacing:.1em;text-transform:uppercase"'
+        if groups:
             rows_b = ""
-            for b in priced:
-                hs = ", ".join(props.get(h, {}).get("name", h) for h in b.get("houses", []))
-                snap = b["snapshot"]
-                b_dep, b_rem, b_over, _ = _payment_state(b)
-                custom_tag = ""
-                if snap.get("override_subtotal") is not None:
-                    custom_tag = ('<span style="color:var(--dim);font-size:10px;'
-                                  'text-transform:uppercase;letter-spacing:.08em">'
-                                  ' custom</span>')
-                if b_over:
-                    paid_cell = (f'${b_dep:,.2f} / <span style="color:var(--err)">'
-                                 f'overpaid</span>')
-                elif b_rem == 0:
-                    paid_cell = f'${b_dep:,.2f} / paid'
-                else:
-                    paid_cell = f'${b_dep:,.2f} / ${b_rem:,.2f}'
-                rows_b += (
-                    f'<tr>'
-                    f'<td style="padding:8px 12px;border-bottom:1px solid #2a322d">{html_esc(b.get("label","?"))}</td>'
-                    f'<td style="padding:8px 12px;border-bottom:1px solid #2a322d">{html_esc(b.get("checkin",""))} → {html_esc(b.get("checkout",""))}</td>'
-                    f'<td style="padding:8px 12px;border-bottom:1px solid #2a322d">{html_esc(hs)}</td>'
-                    f'<td style="padding:8px 12px;border-bottom:1px solid #2a322d">{html_esc(b.get("btype","—"))}</td>'
-                    f'<td style="padding:8px 12px;border-bottom:1px solid #2a322d">${snap.get("subtotal",0):,.2f}{custom_tag}</td>'
-                    f'<td style="padding:8px 12px;border-bottom:1px solid #2a322d">{paid_cell}</td>'
-                    f'<td class="bonus" style="padding:8px 12px;border-bottom:1px solid #2a322d">${snap.get("bonus",0):,.2f}</td>'
-                    f'</tr>'
-                )
+            for b, hits, got, earned in groups:
+                tag = ""
+                if b.get("status") != "active":
+                    tag = ('<span style="color:var(--dim);font-size:10px;'
+                           'text-transform:uppercase"> cancelled</span>')
+                if (b.get("snapshot") or {}).get("override_subtotal") is not None:
+                    tag += ('<span style="color:var(--dim);font-size:10px;'
+                            'text-transform:uppercase"> custom</span>')
+                span = len(hits)
+                for i, pmt in enumerate(hits):
+                    amt = float(pmt.get("amount") or 0)
+                    pb = round(amt * _bonus_ratio(b), 2)
+                    note = (pmt.get("note") or "").strip()
+                    lead = ""
+                    if i == 0:
+                        lead = (
+                            f'<td {td_s} rowspan="{span}">'
+                            f'{html_esc(b.get("label","?"))}{tag}<br>'
+                            f'<span style="color:var(--dim);font-size:11px">'
+                            f'{html_esc(b.get("checkin",""))} → '
+                            f'{html_esc(b.get("checkout",""))}</span></td>'
+                        )
+                    note_html = ""
+                    if note:
+                        note_html = ('<span style="color:var(--dim);font-size:11px"> '
+                                     + html_esc(note) + '</span>')
+                    rows_b += (
+                        f'<tr>{lead}'
+                        f'<td {td_s}>{html_esc(pmt.get("date",""))}</td>'
+                        f'<td {td_s}>{_money(amt)}{note_html}</td>'
+                        f'<td class="bonus" {td_s}>{_money(pb)}</td>'
+                        f'</tr>'
+                    )
             priced_html = (
                 f'<div style="overflow-x:auto"><table {tbl_s}>'
-                f'<thead><tr>'
-                f'<th {th_s}>Label</th><th {th_s}>Dates</th><th {th_s}>Houses</th>'
-                f'<th {th_s}>Type</th><th {th_s}>Guest pays</th>'
-                f'<th {th_s}>Paid / remaining</th><th {th_s}>Anya\'s bonus</th>'
-                f'</tr></thead><tbody>{rows_b}</tbody>'
-                f'<tfoot><tr>'
-                f'<td colspan="6" style="padding:10px 12px;font-weight:bold">Total bonus</td>'
-                f'<td class="bonus" style="padding:10px 12px;font-weight:bold">${total_bonus:,.2f}</td>'
-                f'</tr></tfoot></table></div>'
+                f'<thead><tr><th {th_s}>Booking</th><th {th_s}>Payment date</th>'
+                f'<th {th_s}>Amount</th><th {th_s}>Bonus earned</th></tr></thead>'
+                f'<tbody>{rows_b}</tbody></table></div>'
             )
         else:
-            priced_html = f'<p style="color:var(--dim)">No priced blocks in {html_esc(month_label_b)}.</p>'
+            priced_html = (f'<p style="color:var(--dim)">No payments received in '
+                           f'{html_esc(q_label)}.</p>')
 
-        if unpriced:
-            up_items = "".join(
-                f'<li>{html_esc(b.get("label","?"))}: {html_esc(b.get("checkin",""))} → {html_esc(b.get("checkout",""))}</li>'
-                for b in unpriced
-            )
+        if unpriced_groups:
+            up_items = ""
+            for b, hits, got in unpriced_groups:
+                dates = ", ".join(f'{html_esc(h.get("date",""))} {_money(float(h.get("amount") or 0))}'
+                                  for h in hits)
+                up_items += (f'<li>{html_esc(b.get("label","?"))}: ${got:,.2f} '
+                             f'<span style="color:var(--dim);font-size:11px">'
+                             f'({dates})</span></li>')
             unpriced_html = (
                 f'<div style="margin-top:20px">'
-                f'<h2 style="font:13px Verdana,sans-serif;text-transform:uppercase;letter-spacing:.1em;color:var(--dim);margin-bottom:8px">Unpriced blocks (no snapshot)</h2>'
+                f'<h2 style="font:13px Verdana,sans-serif;text-transform:uppercase;'
+                f'letter-spacing:.1em;color:var(--dim);margin-bottom:8px">'
+                f'Unpriced — bonus not computable</h2>'
                 f'<ul style="padding-left:20px;margin:0;font-size:13px">{up_items}</ul>'
                 f'</div>'
             )
         else:
             unpriced_html = ""
 
+        totals_html = (
+            f'<div class="tot" style="margin-top:16px;display:flex;gap:28px;'
+            f'flex-wrap:wrap;align-items:baseline">'
+            f'<span>Received: <b>${total_received:,.2f}</b></span>'
+            f'<span class="bonus" style="font-size:18px">'
+            f'BONUS DUE: <b>${total_bonus:,.2f}</b></span></div>'
+        )
+
         main_content = (
-            f'<h2 style="font:16px Verdana,sans-serif;margin:0 0 16px">Anya\'s Bonus — {html_esc(month_label_b)}</h2>'
-            f'{bonus_month_nav}'
-            f'<div class="result">{priced_html}{unpriced_html}</div>'
+            f'<h2 style="font:16px Verdana,sans-serif;margin:0 0 16px">'
+            f'Anya\'s Bonus — {html_esc(q_label)} '
+            f'<span style="color:var(--dim);font-size:12px">(cash basis)</span></h2>'
+            f'{bonus_nav}'
+            f'<div class="result">{priced_html}{unpriced_html}{totals_html}</div>'
         )
 
     else:
@@ -843,13 +996,6 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
             edit_parts.append(f"label={urllib.parse.quote(b.get('label', ''), safe='')}")
             if b.get("notes"):
                 edit_parts.append(f"notes={urllib.parse.quote(b['notes'], safe='')}")
-            if b.get("deposit"):
-                edit_parts.append(f"deposit={b['deposit']}")
-            if b.get("override_subtotal"):
-                edit_parts.append(f"override_subtotal={b['override_subtotal']}")
-                if b.get("price_note"):
-                    edit_parts.append(
-                        f"price_note={urllib.parse.quote(b['price_note'], safe='')}")
             if b.get("btype"):
                 edit_parts.append(f"btype={urllib.parse.quote(b['btype'], safe='')}")
                 qp = b.get("quote_params") or {}
@@ -871,23 +1017,29 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
             from pricing_engine import BOOKING_TYPES as _BT
             snap = b.get("snapshot")
             dep, remaining, overpaid, _priced = _payment_state(b)
+            ratio = _bonus_ratio(b)
             if dep:
+                earned = (f'<br>Bonus earned to date: ${dep * ratio:,.2f} '
+                          f'<span style="color:var(--dim)">of '
+                          f'${float(snap.get("bonus", 0) or 0):,.2f}</span>'
+                          ) if ratio else ""
                 if remaining is None:
                     pay_html = (
-                        f'<br>Downpayment: ${dep:,.2f}'
-                        f'<br>Remaining: <span style="color:var(--dim)">— (unpriced)</span>'
+                        f'<br>Received: ${dep:,.2f}'
+                        f'<br>Outstanding: <span style="color:var(--dim)">— (unpriced)</span>'
                     )
                 elif overpaid:
                     pay_html = (
-                        f'<br>Downpayment: ${dep:,.2f}'
-                        f'<br>Remaining: $0.00 '
+                        f'<br>Received: ${dep:,.2f}'
+                        f'<br>Outstanding: $0.00 '
                         f'<span style="color:var(--err)">(overpaid by '
                         f'${dep - float(snap.get("subtotal", 0) or 0):,.2f})</span>'
+                        f'{earned}'
                     )
                 else:
                     pay_html = (
-                        f'<br>Downpayment: ${dep:,.2f}'
-                        f'<br>Remaining: ${remaining:,.2f}'
+                        f'<br>Received: ${dep:,.2f}'
+                        f'<br>Outstanding: ${remaining:,.2f}{earned}'
                     )
             else:
                 pay_html = ""
@@ -1019,6 +1171,7 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
                 f'Created by: {html_esc(b.get("created_by",""))}'
                 f'{(" · " + html_esc(created_at_short)) if created_at_short else ""}</p>'
                 f'{finance_html}'
+                f'{_payments_section(b, kp, confirm_rm)}'
                 f'{notes_html}'
                 f'<div style="border-top:1px solid #2a322d;margin-top:14px;padding-top:12px;'
                 f'display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
@@ -1299,11 +1452,15 @@ def _lambda_handler(event, context):
                 # An existing manual price survives a date/param edit: the amount is
                 # kept verbatim and its fees/bonus are re-derived against the new
                 # snapshot. Whether it still applies is a human call, hence the warning.
-                try:
-                    ov_in = float(qs.get("override_subtotal", "") or 0)
-                except ValueError:
-                    ov_in = 0.0
-                price_note = qs.get("price_note", "").strip()
+                # Read off the block being edited, not the URL: the override and its
+                # note belong to the booking, not to whatever the form posted.
+                ov_in, price_note = 0.0, ""
+                if edit_id:
+                    for _ob in _get_store().list_blocks():
+                        if _ob.get("sk") == edit_id:
+                            ov_in = float(_ob.get("override_subtotal") or 0)
+                            price_note = (_ob.get("price_note") or "").strip()
+                            break
                 if ov_in and snapshot:
                     cleaning = float(snapshot.get("cleaning_total", 0) or 0)
                     if ov_in >= cleaning:
@@ -1319,6 +1476,23 @@ def _lambda_handler(event, context):
                             "for the new dates."
                         )
 
+                # Ledger carried server-side off the block being edited — payments are
+                # too large and too sensitive to thread through a query string, and
+                # the edit path recreates the item, which would otherwise orphan them.
+                carry_payments = []
+                if edit_id:
+                    for _ob in _get_store().list_blocks():
+                        if _ob.get("sk") == edit_id:
+                            carry_payments = [dict(p) for p in _payments_of(_ob)]
+                            break
+                if deposit:
+                    # On add this is payment #1; on edit it is an extra payment taken
+                    # in the same submit. Either way it only reaches the store via
+                    # add_block, which rejects on conflict before writing anything —
+                    # so a conflicting save persists neither the block nor the payment.
+                    carry_payments.append(_new_payment(
+                        deposit, date.today().isoformat(), "downpayment"))
+
                 r = _get_store().add_block(
                     houses, ci, co, label,
                     created_by=f"edited from {edit_id}" if edit_id else "admin",
@@ -1327,9 +1501,9 @@ def _lambda_handler(event, context):
                     quote_params=quote_params_out,
                     btype=snap_btype or None,
                     notes=notes or None,
-                    deposit=deposit or None,
                     override_subtotal=ov_in or None,
                     price_note=price_note or None,
+                    payments=carry_payments or None,
                 )
                 if r["ok"]:
                     if edit_id:
@@ -1344,6 +1518,49 @@ def _lambda_handler(event, context):
             except ValueError as e:
                 msg = f"Error: {e}"
             tab = "block"
+
+        elif action in ("add_payment", "remove_payment"):
+            block_id = qs.get("block_id", "")
+            target = None
+            for b in _get_store().list_blocks():
+                if b.get("sk") == block_id:
+                    target = b
+                    break
+            if not target:
+                msg = "Error: block not found."
+            else:
+                # Derive from the migrated view, so a legacy deposit is materialised
+                # into the ledger by the first write rather than silently dropped.
+                ledger = [dict(p) for p in _payments_of(target)]
+                if action == "remove_payment":
+                    pid = qs.get("payment_id", "")
+                    kept = [p for p in ledger if p.get("id") != pid]
+                    if len(kept) == len(ledger):
+                        msg = "Error: payment not found."
+                    else:
+                        _get_store().set_payments(block_id, kept)
+                        msg = "Payment removed."
+                else:
+                    try:
+                        amt = float(qs.get("amount", "") or 0)
+                    except ValueError:
+                        amt = 0.0
+                    pdate = (qs.get("pay_date", "") or "").strip() or date.today().isoformat()
+                    try:
+                        date.fromisoformat(pdate)
+                    except ValueError:
+                        pdate = ""
+                    if not amt:
+                        msg = "Error: enter a payment amount."
+                    elif not pdate:
+                        msg = "Error: enter a valid payment date."
+                    else:
+                        ledger.append(_new_payment(amt, pdate, qs.get("pay_note", "").strip()))
+                        _get_store().set_payments(block_id, ledger)
+                        msg = f"Payment of ${amt:,.2f} recorded."
+            tab = "block"
+            if not qs.get("details"):
+                qs = dict(qs, details=block_id)
 
         elif action in ("set_price", "revert_price"):
             block_id = qs.get("block_id", "")
@@ -1458,6 +1675,7 @@ def _lambda_handler(event, context):
             avail=price_avail, block_url=price_block_url,
             month_str=month_str, detail_block=detail_block,
             confirm_cancel=confirm_cancel, price_warning=price_warning,
+            confirm_rm=qs.get("confirm_rm", ""), qs_bonus=dict(qs),
         ))
         if via_key:
             resp["cookies"] = [_admin_cookie()]
