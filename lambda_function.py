@@ -18,6 +18,26 @@ _store = None
 
 # New tab names are accepted as aliases of the original query values. Emitted links
 # keep the old values, so bookmarked URLs never break.
+# Admins may back-date to here (retro reservations for stays already taken).
+# Guests can never quote the past — their floor is today.
+_RETRO_FLOOR = date(2026, 7, 1)
+
+
+def _avail_js(min_date):
+    """The shared range picker, floored per audience."""
+    return AVAIL_JS.replace("__MINDATE__", min_date)
+
+
+def _date_floor_error(d, admin):
+    """Message if d is before the caller's allowed floor, else None."""
+    floor = _RETRO_FLOOR if admin else date.today()
+    if d >= floor:
+        return None
+    if admin:
+        return f"earliest allowed: {_fmt_date(floor)}"
+    return "dates in the past cannot be quoted"
+
+
 _TAB_ALIASES = {"reservations": "block", "pricing": "price", "finances": "bonus"}
 
 _BLOCK_COLORS = ["#4e7a5b", "#4a6080", "#7a5a4a", "#6a4f80", "#3d7070"]
@@ -294,6 +314,7 @@ def _render_edit_screen(props, b, pf, admin_key, kp, msg, price_warning, confirm
         f'<label>Add payment ($) <input type="number" name="pay_amount" step="0.01" '
         f'style="width:110px"></label>'
         f'<label>Date <input type="date" name="pay_date" '
+        f'min="{_RETRO_FLOOR.isoformat()}" '
         f'value="{date.today().isoformat()}" style="width:150px"></label>'
         f'<label>Note <input type="text" name="pay_note" placeholder="optional" '
         f'style="min-width:150px"></label></div>'
@@ -330,6 +351,7 @@ def _render_edit_screen(props, b, pf, admin_key, kp, msg, price_warning, confirm
         f'<label>Add expense ($) <input type="number" name="exp_amount" step="0.01" '
         f'style="width:110px"></label>'
         f'<label>Date <input type="date" name="exp_date" '
+        f'min="{_RETRO_FLOOR.isoformat()}" '
         f'value="{date.today().isoformat()}" style="width:150px"></label>'
         f'<label>Note <input type="text" name="exp_note" placeholder="optional" '
         f'style="min-width:150px"></label></div>'
@@ -415,6 +437,7 @@ def _payments_section(b, kp, confirm_remove=""):
         f'<label>Amount ($) <input type="number" name="amount" step="0.01" '
         f'style="width:100px"></label>'
         f'<label>Date <input type="date" name="pay_date" '
+        f'min="{_RETRO_FLOOR.isoformat()}" '
         f'value="{date.today().isoformat()}" style="width:150px"></label>'
         f'<label>Note <input type="text" name="pay_note" '
         f'placeholder="optional" style="min-width:150px"></label>'
@@ -461,6 +484,7 @@ def _expenses_section(b, kp, confirm_remove=""):
         f'<label>Amount ($) <input type="number" name="amount" step="0.01" '
         f'style="width:100px"></label>'
         f'<label>Date <input type="date" name="exp_date" '
+        f'min="{_RETRO_FLOOR.isoformat()}" '
         f'value="{date.today().isoformat()}" style="width:150px"></label>'
         f'<label>Note <input type="text" name="exp_note" '
         f'placeholder="optional" style="min-width:150px"></label>'
@@ -835,7 +859,7 @@ background-repeat:no-repeat;background-position:0 100%;background-size:100% 2px}
 # Flatpickr range script with live availability greying (not an f-string to avoid brace escaping)
 AVAIL_JS = """
 flatpickr('#dates', {
-  mode:'range', dateFormat:'Y-m-d', minDate:'today', showMonths:2,
+  mode:'range', dateFormat:'Y-m-d', minDate:'__MINDATE__', showMonths:2,
   onClose: function(dates) {
     if (dates.length !== 2) return;
     var ci = dates[0].toISOString().slice(0,10);
@@ -1193,7 +1217,7 @@ def render_page(props: dict, params=None, q: Quote = None, error=None,
         f'{form_html}'
         f'</div>'
         f'{FLATPICKR_JS}'
-        f'<script>{AVAIL_JS}</script>'
+        f'<script>{_avail_js("today")}</script>'
         f'</body></html>'
     )
 
@@ -1471,7 +1495,11 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
         win_end = _month_end(ny, nm)
         today_date = date.today()
 
+        # Prev reaches back to the retro floor and stops there — there is nothing
+        # bookable before it, so walking further would only show empty windows.
         py, pm = _prev_month(month_date.year, month_date.month)
+        if date(py, pm, 1) < _RETRO_FLOOR.replace(day=1):
+            py, pm = _RETRO_FLOOR.year, _RETRO_FLOOR.month
         ny2, nm2 = _next_month_ym(month_date.year, month_date.month)
         prev_href = f"/admin?tab=block&month={py}-{pm:02d}{kp}"
         next_href = f"/admin?tab=block&month={ny2}-{nm2:02d}{kp}"
@@ -1811,9 +1839,12 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
         )
 
     if tab == "block":
-        flatpickr_init = '<script>flatpickr("#admin_dates",{mode:"range",dateFormat:"Y-m-d",minDate:"today",showMonths:2});</script>'
+        flatpickr_init = (
+            f'<script>flatpickr("#admin_dates",{{mode:"range",dateFormat:"Y-m-d",'
+            f'minDate:"{_RETRO_FLOOR.isoformat()}",showMonths:2}});</script>'
+        )
     elif tab == "price":
-        flatpickr_init = f'<script>{AVAIL_JS}</script>'
+        flatpickr_init = f'<script>{_avail_js(_RETRO_FLOOR.isoformat())}</script>'
     else:
         flatpickr_init = ""
 
@@ -1908,6 +1939,9 @@ def _lambda_handler(event, context):
                     raise ValueError("Select at least one house")
                 ci = date.fromisoformat(parts[0])
                 co = date.fromisoformat(parts[1])
+                _floor_err = _date_floor_error(ci, admin=True)
+                if _floor_err:
+                    raise ValueError(_floor_err)
                 # Snapshot computation if btype provided
                 snapshot = None
                 quote_params_out = None
@@ -2222,8 +2256,11 @@ def _lambda_handler(event, context):
                     price_avail = _get_store().availability(price_checkin, price_checkout)
                 except Exception:
                     pass
+                _floor_err = _date_floor_error(price_checkin, admin=True)
                 blocked = [h for h in price_bookings if h in price_avail and not price_avail[h]["available"]]
-                if blocked:
+                if _floor_err:
+                    price_error = f"Check your inputs: {_floor_err}"
+                elif blocked:
                     names = ", ".join(props[h]["name"] for h in blocked)
                     price_error = f"Check your inputs: {names} not available for those dates"
                 elif not price_bookings:
@@ -2329,6 +2366,10 @@ def _lambda_handler(event, context):
 
         if not bookings:
             raise ValueError("Select at least one house")
+
+        _floor_err = _date_floor_error(checkin, admin=False)
+        if _floor_err:
+            raise ValueError(_floor_err)
 
         # Server-side block check
         blocked = [h for h in bookings if h in avail and not avail[h]["available"]]

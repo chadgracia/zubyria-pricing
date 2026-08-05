@@ -2,7 +2,7 @@
 import sys
 sys.path.insert(0, ".")
 import lambda_function
-from datetime import date
+from datetime import date, timedelta
 from pricing_engine import FALLBACK_RULES
 
 ADMIN_SECRET = lambda_function.ADMIN_SECRET
@@ -2110,6 +2110,122 @@ t("AT_sup7: successor is the new active record",
 body_sup7 = _q(_store_sup7, 4)
 t("AT_sup7: payments counted once after a real edit",
   "Received: <b>$3,625.00</b>" in body_sup7)
+
+# ── AT_rt: retroactive admin reservations ────────────────────────────────────
+
+print("\n=== Back-dating tests ===")
+
+FLOOR = lambda_function._RETRO_FLOOR
+t("AT_rt0: floor is Jul 1st 2026", FLOOR == date(2026, 7, 1))
+
+# AT_rt1 – admin saves a July 2026 stay and it appears in the July chart window
+_store_rt1 = FakeStore()
+lambda_function._store = _store_rt1
+r_rt1 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "action": "add_block",
+    "dates": "2026-07-10 to 2026-07-13", "h_tseglina": "on",
+    "label": "Retro Stay"}), None)
+t("AT_rt1: retro save succeeds", "Reservation added" in r_rt1["body"])
+t("AT_rt1: dates echoed in readable form",
+  "Jul 10th → Jul 13th, 2026 (3 nights)" in r_rt1["body"])
+_saved_rt1 = _store_rt1._blocks[-1]
+t("AT_rt1: stored with the retro dates", _saved_rt1["checkin"] == "2026-07-10")
+_chart_rt1 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "month": "2026-07"}), None)["body"]
+t("AT_rt1: retro reservation drawn in the July window", "Retro Stay" in _chart_rt1)
+t("AT_rt1: its bar carries the retro check-in",
+  'data-checkin="2026-07-10"' in _chart_rt1)
+
+# AT_rt2 – anything before the floor is refused with the floor message
+r_rt2 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "action": "add_block",
+    "dates": "2026-06-15 to 2026-06-18", "h_tseglina": "on",
+    "label": "Too Early"}), None)
+t("AT_rt2: pre-floor save rejected", "earliest allowed: Jul 1st, 2026" in r_rt2["body"])
+t("AT_rt2: nothing written",
+  all(b.get("label") != "Too Early" for b in _store_rt1._blocks))
+t("AT_rt2: the floor date itself is allowed",
+  lambda_function._date_floor_error(date(2026, 7, 1), admin=True) is None)
+t("AT_rt2: one day earlier is not",
+  lambda_function._date_floor_error(date(2026, 6, 30), admin=True) is not None)
+
+# AT_rt3 – the public calculator cannot quote the past
+_past = (date.today() - timedelta(days=10)).isoformat()
+_past_end = (date.today() - timedelta(days=7)).isoformat()
+lambda_function._store = FakeStore()
+r_rt3 = lambda_function.lambda_handler(ev("/", {
+    "dates": f"{_past} to {_past_end}", "h_tseglina": "on", "g_tseglina": "4",
+    "jacuzzi": "0", "btype": "cash"}), None)
+t("AT_rt3: public past quote rejected", "cannot be quoted" in r_rt3["body"])
+r_rt3j = lambda_function.lambda_handler(ev("/quote.json", {
+    "checkin": _past, "checkout": _past_end, "h_tseglina": "on",
+    "g_tseglina": "4", "jacuzzi": "0", "pets": "0", "btype": "cash"}), None)
+t("AT_rt3: quote.json past quote rejected", r_rt3j["statusCode"] == 400)
+t("AT_rt3: public future quote still works",
+  "Total" in lambda_function.lambda_handler(ev("/", {
+      "dates": "2026-12-30 to 2027-01-02", "h_tseglina": "on", "g_tseglina": "4",
+      "jacuzzi": "0", "btype": "cash"}), None)["body"]
+  or "$" in lambda_function.lambda_handler(ev("/", {
+      "dates": "2026-12-30 to 2027-01-02", "h_tseglina": "on", "g_tseglina": "4",
+      "jacuzzi": "0", "btype": "cash"}), None)["body"])
+t("AT_rt3: guests get today as their floor, not the retro date",
+  lambda_function._date_floor_error(date(2026, 7, 2), admin=False) is not None)
+
+# AT_rt4 – admin PRICING tab prices past dates with the same engine
+lambda_function._store = FakeStore()
+r_rt4 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "price", "dates": "2026-07-10 to 2026-07-13",
+    "h_tseglina": "on", "g_tseglina": "4", "jacuzzi": "0", "btype": "cash"}), None)
+t("AT_rt4: admin can price a past stay", "Anya" in r_rt4["body"]
+  and "earliest allowed" not in r_rt4["body"])
+r_rt4b = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "price", "dates": "2026-06-10 to 2026-06-13",
+    "h_tseglina": "on", "g_tseglina": "4", "jacuzzi": "0", "btype": "cash"}), None)
+t("AT_rt4: pre-floor pricing refused",
+  "earliest allowed: Jul 1st, 2026" in r_rt4b["body"])
+
+# AT_rt5 – a retro payment lands in Q3 2026 with the right accrual
+_store_rt5 = FakeStore([_pl_block(
+    [{"id": "r1", "date": "2026-07-20", "amount": 1000.0, "note": "retro"}])])
+body_rt5 = _q(_store_rt5, 3)
+t("AT_rt5: retro payment appears in Q3 2026", "Jul 20th, 2026" in body_rt5)
+t("AT_rt5: received counted", "Received: <b>$1,000.00</b>" in body_rt5)
+t("AT_rt5: accrual uses the usual ratio", "$156.80" in body_rt5)
+t("AT_rt5: BONUS DUE reflects it", "BONUS DUE: <b>$156.80</b>" in body_rt5)
+t("AT_rt5: it does not leak into Q4", "Jul 20th, 2026" not in _q(_store_rt5, 4))
+
+# AT_rt6 – picker floors differ by audience
+_pub = lambda_function.lambda_handler(ev("/"), None)["body"]
+_adm_price = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "price"}), None)["body"]
+_adm_block = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block"}), None)["body"]
+t("AT_rt6: public picker floors at today", "minDate:'today'" in _pub)
+t("AT_rt6: public picker does not offer the retro floor",
+  "2026-07-01" not in _pub)
+t("AT_rt6: admin pricing picker floors at the retro date",
+  "minDate:'2026-07-01'" in _adm_price)
+t("AT_rt6: admin stay picker floors at the retro date",
+  'minDate:"2026-07-01"' in _adm_block)
+lambda_function._store = _store_rt1
+t("AT_rt6: payment date input accepts back to the floor",
+  'name="pay_date" min="2026-07-01"' in
+  lambda_function.lambda_handler(ev("/admin", {
+      "key": ADMIN_SECRET, "tab": "block", "details": _saved_rt1["sk"]}), None)["body"])
+t("AT_rt6: expense date input accepts back to the floor",
+  'name="exp_date" min="2026-07-01"' in
+  lambda_function.lambda_handler(ev("/admin", {
+      "key": ADMIN_SECRET, "tab": "block", "details": _saved_rt1["sk"]}), None)["body"])
+
+# AT_rt7 – chart Prev reaches July 2026 and clamps there
+lambda_function._store = _store_rt1
+_aug = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "month": "2026-08"}), None)["body"]
+t("AT_rt7: Prev from Aug 2026 reaches Jul 2026", "month=2026-07" in _aug)
+_jul = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "month": "2026-07"}), None)["body"]
+t("AT_rt7: Prev from Jul 2026 clamps at Jul 2026", "month=2026-07" in _jul)
+t("AT_rt7: Prev never offers June 2026", "month=2026-06" not in _jul)
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 print()
