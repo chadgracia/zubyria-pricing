@@ -183,6 +183,20 @@ class Store:
             ExpressionAttributeValues={":e": _to_dynamo(expenses)},
         )
 
+    def supersede_block(self, block_id, new_sk):
+        """Retire a record because an edit replaced it.
+
+        Distinct from cancel_block: a superseded record's money lives on the new
+        record, so the finances report must not count it twice. A real guest
+        cancellation still uses cancel_block and keeps counting.
+        """
+        self._t.update_item(
+            Key={"pk": "BLOCK", "sk": block_id},
+            UpdateExpression="SET #s = :s, #b = :b",
+            ExpressionAttributeNames={"#s": "status", "#b": "superseded_by"},
+            ExpressionAttributeValues={":s": "superseded", ":b": new_sk},
+        )
+
     def cancel_block(self, block_id):
         self._t.update_item(
             Key={"pk": "BLOCK", "sk": block_id},

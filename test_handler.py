@@ -111,7 +111,7 @@ class FakeStore:
         if price_note:
             item["price_note"] = price_note
         self._blocks.append(item)
-        return {"ok": True}
+        return {"ok": True, "id": sk}
 
     def set_payments(self, block_id, payments):
         for b in self._blocks:
@@ -133,6 +133,12 @@ class FakeStore:
                 else:
                     b["override_subtotal"] = override_subtotal
                     b["price_note"] = price_note or ""
+
+    def supersede_block(self, block_id, new_sk):
+        for b in self._blocks:
+            if b.get("sk") == block_id:
+                b["status"] = "superseded"
+                b["superseded_by"] = new_sk
 
     def cancel_block(self, block_id):
         for b in self._blocks:
@@ -354,7 +360,10 @@ r = lambda_function.lambda_handler(ev("/admin", {
     "h_tseglina": "on", "label": "Original Guest",
 }), None)
 t("AT1: edit success (no self-conflict)", "Reservation updated" in r["body"] or "Reservation added" in r["body"])
-t("AT1: original block cancelled", _store_at1._blocks[0]["status"] == "cancelled")
+t("AT1: original marked superseded, not cancelled",
+  _store_at1._blocks[0]["status"] == "superseded")
+t("AT1: superseded record points at its replacement",
+  bool(_store_at1._blocks[0].get("superseded_by")))
 t("AT1: new active block for new dates",
   any(b["status"] == "active" and b.get("checkin") == "2026-09-11" for b in _store_at1._blocks))
 
@@ -418,7 +427,7 @@ lambda_function.lambda_handler(ev("/admin", {
     "h_tseglina": "on", "label": "Reprice Test",
     "btype": "cash", "g_tseglina": "2",
 }), None)
-t("AT3: original cancelled on edit", _store_at3._blocks[0]["status"] == "cancelled")
+t("AT3: original superseded on edit", _store_at3._blocks[0]["status"] == "superseded")
 new_b3 = next((b for b in _store_at3._blocks if b.get("status") == "active"), None)
 t("AT3: new active block has snapshot", new_b3 is not None and "snapshot" in (new_b3 or {}))
 # Aug 23 = Sun (before holiday Mon Aug 24): weekend $200; Aug 24 = IndepDay x2 on weekday = $200; Aug 25 = weekday $100
@@ -1973,6 +1982,134 @@ _r_tx10n = lambda_function.lambda_handler(ev("/admin", {
 t("AT_tx10: non-admin cannot add an expense",
   "Access denied" in _r_tx10n["body"]
   and len([x for x in _store_tx8._blocks if x["sk"] == _n_tx8["sk"]][0]["expenses"]) == 1)
+
+# ── AT_sup: superseded vs cancelled ──────────────────────────────────────────
+
+print("\n=== Superseded vs cancelled tests ===")
+
+# ratio 340/2000 = 0.17, so 1130 received accrues exactly 192.10
+_SUP_SNAP = {"subtotal": 2000.0, "gross_profit": 1700.0, "bonus": 340.0,
+             "cleaning_total": 200.0, "rental_price": 1800.0}
+
+def _sup_seed():
+    """Old-style data: A was cancelled by an edit that produced B carrying A's payment."""
+    A = {"pk": "blocks", "sk": "block#A", "houses": ["tseglina"],
+         "checkin": "2026-10-02", "checkout": "2026-10-06",
+         "label": "Petrenko wedding", "created_by": "admin",
+         "created_at": "2026-08-01T10:00:00", "status": "cancelled",
+         "btype": "cash", "snapshot": dict(_SUP_SNAP),
+         "payments": [{"id": "p1", "date": "2026-10-05", "amount": 800.0,
+                       "note": "deposit"}]}
+    B = {"pk": "blocks", "sk": "block#B", "houses": ["tseglina"],
+         "checkin": "2026-10-02", "checkout": "2026-10-07",
+         "label": "Petrenko wedding", "created_by": "edited from block#A",
+         "created_at": "2026-09-01T10:00:00", "status": "active",
+         "btype": "cash", "snapshot": dict(_SUP_SNAP),
+         "payments": [{"id": "p1", "date": "2026-10-05", "amount": 800.0,
+                       "note": "deposit"},
+                      {"id": "p2", "date": "2026-11-10", "amount": 330.0,
+                       "note": "balance"}]}
+    return A, B
+
+# AT_sup1 – legacy edit lineage: the 800 is counted ONCE
+_A, _B = _sup_seed()
+_store_sup1 = FakeStore([_A, _B])
+body_sup1 = _q(_store_sup1, 4)
+t("AT_sup1: received counts the payment once (1130, not 1930)",
+  "Received: <b>$1,130.00</b>" in body_sup1)
+t("AT_sup1: bonus due is the single-copy figure 192.10",
+  "BONUS DUE: <b>$192.10</b>" in body_sup1)
+t("AT_sup1: superseded ancestor is not listed as a payer",
+  body_sup1.count("Petrenko wedding") == 2)  # live group + excluded note
+t("AT_sup1: exclusion is disclosed, not silent",
+  "superseded by an edit" in body_sup1)
+t("AT_sup1: excluded note names the amount", "$800.00 received" in body_sup1)
+
+# AT_sup2 – a genuinely cancelled reservation keeps counting
+_C = {"pk": "blocks", "sk": "block#C", "houses": ["modryna"],
+      "checkin": "2026-11-01", "checkout": "2026-11-03", "label": "Real Cancellation",
+      "created_by": "admin", "created_at": "2026-08-01T10:00:00",
+      "status": "cancelled", "btype": "cash", "snapshot": dict(_SUP_SNAP),
+      "payments": [{"id": "c1", "date": "2026-11-02", "amount": 500.0, "note": "kept"}]}
+_store_sup2 = FakeStore([_A, _B, _C])
+body_sup2 = _q(_store_sup2, 4)
+t("AT_sup2: real cancellation still counts",
+  "Real Cancellation" in body_sup2 and "$500.00" in body_sup2)
+t("AT_sup2: received is 1130 + 500", "Received: <b>$1,630.00</b>" in body_sup2)
+t("AT_sup2: bonus adds the cancelled record's accrual",
+  "BONUS DUE: <b>$277.10</b>" in body_sup2)   # 192.10 + 500*0.17
+t("AT_sup2: cancelled record is not in the excluded note",
+  "Real Cancellation" not in body_sup2.split("superseded by an edit")[1])
+
+# AT_sup3 – helper-level classification
+_sup_set = lambda_function._superseded_sks([_A, _B, _C])
+t("AT_sup3: legacy 'edited from' parsed into lineage", "block#A" in _sup_set)
+t("AT_sup3: genuinely cancelled record is not in the set", "block#C" not in _sup_set)
+t("AT_sup3: A classified superseded", lambda_function._is_superseded(_A, _sup_set))
+t("AT_sup3: C classified not superseded",
+  not lambda_function._is_superseded(_C, _sup_set))
+t("AT_sup3: explicit status alone is enough",
+  lambda_function._is_superseded({"sk": "x", "status": "superseded"}, set()))
+t("AT_sup3: new-style edited_from also detected",
+  "block#Z" in lambda_function._superseded_sks(
+      [{"sk": "y", "edited_from": "block#Z"}]))
+
+# AT_sup4 – superseded behaves as inactive for availability / conflicts / chart
+_store_sup4 = FakeStore([
+    {"pk": "blocks", "sk": "block#S", "houses": ["tseglina"],
+     "checkin": "2026-12-01", "checkout": "2026-12-05", "label": "Superseded Stay",
+     "created_by": "admin", "status": "superseded", "superseded_by": "block#T"},
+])
+lambda_function._store = _store_sup4
+_avail = _store_sup4.availability(date(2026, 12, 2), date(2026, 12, 4))
+t("AT_sup4: superseded record frees its dates",
+  _avail.get("tseglina", {}).get("available", True) is True)
+r_sup4 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "action": "add_block",
+    "dates": "2026-12-02 to 2026-12-04", "h_tseglina": "on",
+    "label": "New Booking"}), None)
+t("AT_sup4: no conflict against a superseded record",
+  "Reservation added" in r_sup4["body"])
+_chart = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "month": "2026-12"}), None)["body"]
+t("AT_sup4: superseded record is not drawn on the chart",
+  "Superseded Stay" not in _chart)
+
+# AT_sup5 – provenance never prints a raw sk, legacy or new
+lambda_function._store = FakeStore([_A, _B])
+_det_sup5 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "details": "block#B"}), None)["body"]
+t("AT_sup5: legacy 'edited from <sk>' renders as Edited <date>",
+  "Edited Sep 1st, 2026" in _det_sup5)
+t("AT_sup5: no raw ancestor sk in visible text",
+  "block#A" not in _visible(_det_sup5))
+t("AT_sup5: no 'edited from' phrasing survives",
+  "edited from" not in _det_sup5.lower())
+
+# AT_sup6 – expenses follow the same single-count rule across an edit
+_Ae = dict(_A, expenses=[{"id": "x1", "date": "2026-11-25", "amount": 200.0,
+                          "note": "linens"}])
+_Be = dict(_B, expenses=[{"id": "x1", "date": "2026-11-25", "amount": 200.0,
+                          "note": "linens"}])
+body_sup6 = _q(FakeStore([_Ae, _Be]), 4)
+t("AT_sup6: expense counted once, not twice",
+  "Expenses: <b>$200.00</b>" in body_sup6)
+t("AT_sup6: bonus due nets one expense only",
+  "BONUS DUE: <b>$152.10</b>" in body_sup6)   # 192.10 - 40.00
+
+# AT_sup7 – a live edit now supersedes rather than cancels, and money stays single
+_store_sup7 = FakeStore([_pl_block(_two)])
+r_sup7 = _save(_store_sup7, "block#pl", dates="2026-09-20 to 2026-09-24",
+               h_tseglina="on", label="Ledger Guest")
+t("AT_sup7: edit succeeds", "Reservation updated" in r_sup7["body"])
+_old7 = [b for b in _store_sup7._blocks if b["sk"] == "block#pl"][0]
+t("AT_sup7: old record marked superseded", _old7["status"] == "superseded")
+t("AT_sup7: old record records its successor", bool(_old7.get("superseded_by")))
+t("AT_sup7: successor is the new active record",
+  _old7["superseded_by"] == _active(_store_sup7, "2026-09-20")["sk"])
+body_sup7 = _q(_store_sup7, 4)
+t("AT_sup7: payments counted once after a real edit",
+  "Received: <b>$3,625.00</b>" in body_sup7)
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 print()

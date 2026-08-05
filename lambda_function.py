@@ -638,10 +638,52 @@ def _fmt_range(ci, co):
     return f"{out} ({nights} night{'' if nights == 1 else 's'})"
 
 
+_LEGACY_EDIT_RE = __import__("re").compile(r"^\s*edited from\s+(\S+)\s*$", __import__("re").I)
+
+
+def _lineage_parent(b):
+    """The sk this record was edited from, or None.
+
+    New records carry edited_from. Records written before that field existed
+    encoded the lineage in created_by as "edited from <sk>"; parse those too so the
+    migration needs no backfill.
+    """
+    if b.get("edited_from"):
+        return b["edited_from"]
+    m = _LEGACY_EDIT_RE.match(str(b.get("created_by") or ""))
+    return m.group(1) if m else None
+
+
+def _superseded_sks(blocks):
+    """sks that a later edit replaced — their money lives on the newer record.
+
+    Covers both the explicit marker (status/superseded_by, written going forward)
+    and the legacy shape, where the edit only left the successor pointing back.
+    """
+    out = set()
+    for b in blocks:
+        parent = _lineage_parent(b)
+        if parent:
+            out.add(parent)
+        if b.get("superseded_by"):
+            out.add(b["sk"])
+    return out
+
+
+def _is_superseded(b, superseded_sks):
+    """True when this record was replaced by an edit rather than cancelled.
+
+    A genuine guest cancellation is NOT superseded: its money still counts.
+    """
+    if b.get("status") == "superseded":
+        return True
+    return b.get("status") == "cancelled" and b.get("sk") in superseded_sks
+
+
 def _provenance(b):
     """Human provenance line. Never renders a raw sk."""
     when = _fmt_date(b.get("created_at", ""))
-    if b.get("edited_from"):
+    if _lineage_parent(b):
         return f"Edited {when}" if when else "Edited"
     who = (b.get("created_by") or "").strip()
     if when and who:
@@ -1206,10 +1248,18 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
 
         # Collect payments in range, grouped by block. Cancelled blocks are included:
         # money that changed hands still counts in the quarter it was received.
+        # Records replaced by an edit are excluded outright: the live copy carries
+        # their payments and expenses, so counting both double-counts the money.
+        # Genuinely cancelled records still count — that money really changed hands.
+        _sup = _superseded_sks(blocks)
+        excluded = [b for b in blocks if _is_superseded(b, _sup)
+                    and (_payments_of(b) or _expenses_of(b))]
+        _live = [b for b in blocks if not _is_superseded(b, _sup)]
+
         groups, unpriced_groups = [], []
         total_received = 0.0
         total_bonus = 0.0
-        for b in sorted(blocks, key=lambda x: (x.get("label") or "")):
+        for b in sorted(_live, key=lambda x: (x.get("label") or "")):
             hits = [p for p in _payments_of(b)
                     if q_start.isoformat() <= (p.get("date") or "") <= q_end.isoformat()]
             if not hits:
@@ -1229,7 +1279,7 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
         # matching how payment accruals round.
         from pricing_engine import BONUS_PCT as _BPCT
         exp_groups, total_expenses, total_exp_impact = [], 0.0, 0.0
-        for b in sorted(blocks, key=lambda x: (x.get("label") or "")):
+        for b in sorted(_live, key=lambda x: (x.get("label") or "")):
             hits = [e for e in _expenses_of(b)
                     if q_start.isoformat() <= (e.get("date") or "") <= q_end.isoformat()]
             if not hits:
@@ -1366,6 +1416,22 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
         else:
             unpriced_html = ""
 
+        if excluded:
+            ex_items = "".join(
+                f'<li>{html_esc(b.get("label","?"))} — '
+                f'{_money(round(sum(float(p.get("amount") or 0) for p in _payments_of(b)), 2))}'
+                f' received, '
+                f'{_money(_expense_total(b))} expenses</li>'
+                for b in excluded)
+            excluded_html = (
+                f'<div style="margin-top:20px;color:var(--dim);font-size:12px">'
+                f'<p style="margin:0 0 4px">Excluded (superseded by an edit) — '
+                f'counted on the current version of each reservation:</p>'
+                f'<ul style="padding-left:20px;margin:0">{ex_items}</ul></div>'
+            )
+        else:
+            excluded_html = ""
+
         totals_html = (
             f'<div class="tot" style="margin-top:16px;display:flex;gap:28px;'
             f'flex-wrap:wrap;align-items:baseline">'
@@ -1380,7 +1446,7 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
             f'Anya\'s Bonus — {html_esc(q_label)} '
             f'<span style="color:var(--dim);font-size:12px">(cash basis)</span></h2>'
             f'{bonus_nav}'
-            f'<div class="result">{priced_html}{expenses_html}{unpriced_html}{totals_html}</div>'
+            f'<div class="result">{priced_html}{expenses_html}{unpriced_html}{excluded_html}{totals_html}</div>'
         )
 
     elif tab == "block" and prefill and (prefill.get("edit_id") or "").strip() \
@@ -1982,7 +2048,9 @@ def _lambda_handler(event, context):
                 )
                 if r["ok"]:
                     if edit_id:
-                        _get_store().cancel_block(edit_id)
+                        # Supersede, not cancel: the money moved to the new record,
+                        # so finances must not count both copies.
+                        _get_store().supersede_block(edit_id, r.get("id") or "")
                         msg = f"Reservation updated: {label} ({_fmt_range(parts[0], parts[1])})"
                     else:
                         msg = f"Reservation added: {label} ({_fmt_range(parts[0], parts[1])})"
