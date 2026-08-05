@@ -87,7 +87,7 @@ class Store:
     def add_block(self, houses, checkin, checkout, label, created_by="admin",
                   exclude_id=None, snapshot=None, quote_params=None, btype=None,
                   notes=None, deposit=None, override_subtotal=None, price_note=None,
-                  payments=None):
+                  payments=None, expenses=None, edited_from=None):
         """Check availability for the given houses (excluding exclude_id block); if any conflict,
         return {"ok": False, "conflicts": [label, ...]} without writing.
         On success write the item and return {"ok": True, "id": sk}."""
@@ -123,6 +123,11 @@ class Store:
             item["deposit"] = deposit
         if payments is not None:
             item["payments"] = payments
+        if expenses is not None:
+            item["expenses"] = expenses
+        if edited_from:
+            # Lineage kept for auditing; never rendered as a raw id.
+            item["edited_from"] = edited_from
         if override_subtotal:
             item["override_subtotal"] = override_subtotal
         if price_note:
@@ -167,6 +172,15 @@ class Store:
             UpdateExpression="SET #p = :p",
             ExpressionAttributeNames={"#p": "payments"},
             ExpressionAttributeValues={":p": _to_dynamo(payments)},
+        )
+
+    def set_expenses(self, block_id, expenses):
+        """Replace a reservation's expense ledger wholesale (mirrors set_payments)."""
+        self._t.update_item(
+            Key={"pk": "BLOCK", "sk": block_id},
+            UpdateExpression="SET #e = :e",
+            ExpressionAttributeNames={"#e": "expenses"},
+            ExpressionAttributeValues={":e": _to_dynamo(expenses)},
         )
 
     def cancel_block(self, block_id):

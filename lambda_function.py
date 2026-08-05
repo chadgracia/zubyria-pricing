@@ -16,6 +16,10 @@ ADMIN_SECRET = "zubyria$admin!7kQ2mXf9pLw4"
 # Tests override this directly: lambda_function._store = FakeStore(...)
 _store = None
 
+# New tab names are accepted as aliases of the original query values. Emitted links
+# keep the old values, so bookmarked URLs never break.
+_TAB_ALIASES = {"reservations": "block", "pricing": "price", "finances": "bonus"}
+
 _BLOCK_COLORS = ["#4e7a5b", "#4a6080", "#7a5a4a", "#6a4f80", "#3d7070"]
 
 # Tape-chart day column width in px. Must match .tape-dc in CSS — bar geometry is
@@ -235,7 +239,7 @@ def _render_edit_screen(props, b, pf, admin_key, kp, msg, price_warning, confirm
                   f'&block_id={urllib.parse.quote(b["sk"], safe="")}{kp}" '
                   f'class="btn-sec" style="margin-left:8px">Revert to calculated</a>')
     price = (
-        f'<fieldset {sec}><legend {lg}>2 · Price</legend>'
+        f'<fieldset {sec}><legend {lg}>2 · Pricing</legend>'
         f'<div class="row"><label>Booking type '
         f'<select name="btype">{btype_opts}</select></label></div>'
         f'<p style="margin:10px 0 6px;font:13px Verdana,sans-serif">{calc_line}</p>'
@@ -266,7 +270,7 @@ def _render_edit_screen(props, b, pf, admin_key, kp, msg, price_warning, confirm
             rm = (f'<a href="/admin?tab=block&edit_id={bid}'
                   f'&confirm_rm={urllib.parse.quote(pid, safe="")}{kp}" '
                   f'style="color:var(--dim);font-size:11px">remove</a>')
-        rows += (f'<li style="margin-bottom:3px">{html_esc(p.get("date",""))} — '
+        rows += (f'<li style="margin-bottom:3px">{html_esc(_fmt_date(p.get("date","")))} — '
                  f'<b>{_money(float(p.get("amount") or 0))}</b>'
                  f'{(" — " + html_esc(note)) if note else ""} &nbsp;{rm}</li>')
     listing = (f'<ul style="padding-left:18px;margin:0 0 10px;'
@@ -299,6 +303,44 @@ def _render_edit_screen(props, b, pf, admin_key, kp, msg, price_warning, confirm
         f'</fieldset>'
     )
 
+    exp_rows = ""
+    for e in _expenses_of(b):
+        eid = e.get("id", "")
+        enote = (e.get("note") or "").strip()
+        if confirm_rm and confirm_rm == eid:
+            erm = (f'<a href="/admin?tab=block&action=remove_expense&block_id={bid}'
+                   f'&expense_id={urllib.parse.quote(eid, safe="")}&back=edit{kp}" '
+                   f'style="color:var(--err);font-size:11px">confirm remove</a>')
+        else:
+            erm = (f'<a href="/admin?tab=block&edit_id={bid}'
+                   f'&confirm_rm={urllib.parse.quote(eid, safe="")}{kp}" '
+                   f'style="color:var(--dim);font-size:11px">remove</a>')
+        exp_rows += (f'<li style="margin-bottom:3px">{html_esc(_fmt_date(e.get("date","")))}'
+                     f' — <b>{_money(float(e.get("amount") or 0))}</b>'
+                     f'{(" — " + html_esc(enote)) if enote else ""} &nbsp;{erm}</li>')
+    exp_list = (f'<ul style="padding-left:18px;margin:0 0 10px;'
+                f'font:12px/1.6 Verdana,sans-serif">{exp_rows}</ul>') if exp_rows else (
+        '<p style="color:var(--dim);font-size:12px;margin:0 0 10px">'
+        'No expenses recorded.</p>')
+    exp_tot = _expense_total(b)
+    expenses_html = (
+        f'<fieldset {sec}><legend {lg}>4 · Expenses</legend>'
+        f'{exp_list}'
+        f'<div class="row" style="align-items:flex-end">'
+        f'<label>Add expense ($) <input type="number" name="exp_amount" step="0.01" '
+        f'style="width:110px"></label>'
+        f'<label>Date <input type="date" name="exp_date" '
+        f'value="{date.today().isoformat()}" style="width:150px"></label>'
+        f'<label>Note <input type="text" name="exp_note" placeholder="optional" '
+        f'style="min-width:150px"></label></div>'
+        f'<p style="margin:10px 0 0;font:13px Verdana,sans-serif">'
+        f'Expenses: <b>{_money(exp_tot)}</b></p>'
+        f'<p style="color:var(--dim);font-size:11px;font-family:Verdana;margin:6px 0 0">'
+        f'Your costs, not guest credits — these reduce the bonus but never change '
+        f'what the guest still owes.</p>'
+        f'</fieldset>'
+    )
+
     if msg or price_warning:
         colour = "var(--err)" if msg.lower().startswith(("error", "conflict")) else "var(--ok)"
         banner = '<div class="result" style="margin-bottom:16px">'
@@ -324,7 +366,7 @@ def _render_edit_screen(props, b, pf, admin_key, kp, msg, price_warning, confirm
         f'<input type="hidden" name="action" value="add_block">'
         f'<input type="hidden" name="edit_id" value="{html_esc(b["sk"])}">'
         f'{key_hidden}'
-        f'{stay}{price}{payments}'
+        f'{stay}{price}{payments}{expenses_html}'
         f'<button type="submit">Save reservation</button>'
         f'<a href="{html_esc(back)}" class="btn-sec" style="margin-left:10px">Cancel</a>'
         f'</form>'
@@ -351,8 +393,8 @@ def _payments_section(b, kp, confirm_remove=""):
                   f'&confirm_rm={urllib.parse.quote(pid, safe="")}{kp}" '
                   f'style="color:var(--dim);font-size:11px">remove</a>')
         rows += (
-            f'<li style="margin-bottom:3px">{html_esc(p.get("date",""))} — '
-            f'<b>${amt:,.2f}</b>'
+            f'<li style="margin-bottom:3px">{html_esc(_fmt_date(p.get("date","")))} — '
+            f'<b>{_money(amt)}</b>'
             f'{(" — " + html_esc(note)) if note else ""} &nbsp;{rm}</li>'
         )
     listing = (f'<ul style="padding-left:18px;margin:6px 0 10px;font:12px/1.6 Verdana,'
@@ -377,6 +419,52 @@ def _payments_section(b, kp, confirm_remove=""):
         f'<label>Note <input type="text" name="pay_note" '
         f'placeholder="optional" style="min-width:150px"></label>'
         f'<button type="submit">Add payment</button>'
+        f'</div></form></div>'
+    )
+
+
+def _expenses_section(b, kp, confirm_remove=""):
+    """Expense ledger + quick-add for the details view (mirrors _payments_section)."""
+    key_hidden = (f'<input type="hidden" name="key" value="{html_esc(kp[5:])}">'
+                  if kp else "")
+    bid = urllib.parse.quote(b["sk"], safe="")
+    rows = ""
+    for e in _expenses_of(b):
+        eid = e.get("id", "")
+        note = (e.get("note") or "").strip()
+        if confirm_remove and confirm_remove == eid:
+            rm = (f'<a href="/admin?tab=block&action=remove_expense'
+                  f'&block_id={bid}&expense_id={urllib.parse.quote(eid, safe="")}{kp}" '
+                  f'style="color:var(--err);font-size:11px">confirm remove</a>')
+        else:
+            rm = (f'<a href="/admin?tab=block&details={bid}'
+                  f'&confirm_rm={urllib.parse.quote(eid, safe="")}{kp}" '
+                  f'style="color:var(--dim);font-size:11px">remove</a>')
+        rows += (f'<li style="margin-bottom:3px">{html_esc(_fmt_date(e.get("date","")))}'
+                 f' — <b>{_money(float(e.get("amount") or 0))}</b>'
+                 f'{(" — " + html_esc(note)) if note else ""} &nbsp;{rm}</li>')
+    listing = (f'<ul style="padding-left:18px;margin:6px 0 10px;'
+               f'font:12px/1.6 Verdana,sans-serif">{rows}</ul>') if rows else (
+        '<p style="color:var(--dim);font-size:12px;margin:6px 0 10px">'
+        'No expenses recorded.</p>')
+    return (
+        f'<div style="margin-top:14px">'
+        f'<h3 style="font:11px Verdana,sans-serif;text-transform:uppercase;'
+        f'letter-spacing:.1em;color:var(--dim);margin:0 0 4px">Expenses</h3>'
+        f'{listing}'
+        f'<form method="get" action="/admin">'
+        f'<input type="hidden" name="tab" value="block">'
+        f'<input type="hidden" name="action" value="add_expense">'
+        f'<input type="hidden" name="block_id" value="{html_esc(b["sk"])}">'
+        f'{key_hidden}'
+        f'<div class="row" style="align-items:flex-end">'
+        f'<label>Amount ($) <input type="number" name="amount" step="0.01" '
+        f'style="width:100px"></label>'
+        f'<label>Date <input type="date" name="exp_date" '
+        f'value="{date.today().isoformat()}" style="width:150px"></label>'
+        f'<label>Note <input type="text" name="exp_note" '
+        f'placeholder="optional" style="min-width:150px"></label>'
+        f'<button type="submit">Add expense</button>'
         f'</div></form></div>'
     )
 
@@ -449,6 +537,23 @@ def _new_payment(amount, date_str, note):
             "amount": round(float(amount), 2), "note": note or ""}
 
 
+def _exp_line(b):
+    tot = _expense_total(b)
+    return f'<br>Expenses: {_money(tot)}' if tot else ""
+
+
+def _expenses_of(b):
+    """The reservation's expense ledger. Mirrors _payments_of but has no legacy
+    scalar to migrate, so it is simply the stored list."""
+    exp = b.get("expenses")
+    return sorted(exp, key=lambda e: (e.get("date") or "", e.get("id") or "")) \
+        if isinstance(exp, list) else []
+
+
+def _expense_total(b):
+    return round(sum(float(e.get("amount") or 0) for e in _expenses_of(b)), 2)
+
+
 def _effective_subtotal(b):
     snap = b.get("snapshot")
     return float(snap.get("subtotal", 0) or 0) if snap else None
@@ -499,6 +604,51 @@ def _next_month_ym(y, m):
     if m == 13:
         return y + 1, 1
     return y, m
+
+
+def _ord(n):
+    """1st, 2nd, 3rd, 4th … 11th/12th/13th are the exceptions to the 1/2/3 rule."""
+    if 11 <= (n % 100) <= 13:
+        return f"{n}th"
+    return f"{n}{ {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th') }"
+
+
+def _fmt_date(iso, with_year=True):
+    """'2026-08-14' -> 'Aug 14th, 2026'. ISO is kept for URLs, JSON and storage."""
+    if not iso:
+        return ""
+    try:
+        d = date.fromisoformat(str(iso)[:10])
+    except ValueError:
+        return str(iso)
+    head = f"{d.strftime('%b')} {_ord(d.day)}"
+    return f"{head}, {d.year}" if with_year else head
+
+
+def _fmt_range(ci, co):
+    """'Aug 14th → Aug 16th, 2026 (2 nights)', repeating the year only if it differs."""
+    try:
+        a, b = date.fromisoformat(str(ci)[:10]), date.fromisoformat(str(co)[:10])
+    except (ValueError, TypeError):
+        return f"{ci} → {co}"
+    nights = (b - a).days
+    same_year = a.year == b.year
+    left = _fmt_date(a, with_year=not same_year)
+    out = f"{left} → {_fmt_date(b)}"
+    return f"{out} ({nights} night{'' if nights == 1 else 's'})"
+
+
+def _provenance(b):
+    """Human provenance line. Never renders a raw sk."""
+    when = _fmt_date(b.get("created_at", ""))
+    if b.get("edited_from"):
+        return f"Edited {when}" if when else "Edited"
+    who = (b.get("created_by") or "").strip()
+    if when and who:
+        return f"Created {when} by {html_esc(who)}"
+    if when:
+        return f"Created {when}"
+    return f"Created by {html_esc(who)}" if who else ""
 
 
 def _money(x):
@@ -1021,9 +1171,9 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
     tab_bonus_href = f"/admin?tab=bonus{kp}"
     tab_nav = (
         f'<nav class="tab-nav">'
-        f'<a href="{tab_block_href}" class="{"active" if tab == "block" else ""}">Block</a>'
-        f'<a href="{tab_price_href}" class="{"active" if tab == "price" else ""}">Price</a>'
-        f'<a href="{tab_bonus_href}" class="{"active" if tab == "bonus" else ""}">Bonus</a>'
+        f'<a href="{tab_block_href}" class="{"active" if tab == "block" else ""}">Reservations</a>'
+        f'<a href="{tab_price_href}" class="{"active" if tab == "price" else ""}">Pricing</a>'
+        f'<a href="{tab_bonus_href}" class="{"active" if tab == "bonus" else ""}">Finances</a>'
         f'</nav>'
     )
 
@@ -1074,8 +1224,26 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
                                    for p in hits), 2)
                 total_bonus += earned
                 groups.append((b, hits, got, earned))
+        # Expenses reduce profit, and the bonus is a share of profit, so each
+        # expense in the quarter claws back BONUS_PCT of itself. Rounded per entry,
+        # matching how payment accruals round.
+        from pricing_engine import BONUS_PCT as _BPCT
+        exp_groups, total_expenses, total_exp_impact = [], 0.0, 0.0
+        for b in sorted(blocks, key=lambda x: (x.get("label") or "")):
+            hits = [e for e in _expenses_of(b)
+                    if q_start.isoformat() <= (e.get("date") or "") <= q_end.isoformat()]
+            if not hits:
+                continue
+            spent = round(sum(float(e.get("amount") or 0) for e in hits), 2)
+            impact = round(sum(round(float(e.get("amount") or 0) * _BPCT, 2)
+                               for e in hits), 2)
+            total_expenses += spent
+            total_exp_impact += impact
+            exp_groups.append((b, hits, spent, impact))
         total_received = round(total_received, 2)
-        total_bonus = round(total_bonus, 2)
+        total_expenses = round(total_expenses, 2)
+        total_exp_impact = round(total_exp_impact, 2)
+        total_bonus = round(total_bonus - total_exp_impact, 2)
 
         qnav = ""
         for qi in range(1, 5):
@@ -1122,8 +1290,8 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
                             f'<td {td_s} rowspan="{span}">'
                             f'{html_esc(b.get("label","?"))}{tag}<br>'
                             f'<span style="color:var(--dim);font-size:11px">'
-                            f'{html_esc(b.get("checkin",""))} → '
-                            f'{html_esc(b.get("checkout",""))}</span></td>'
+                            f'{html_esc(_fmt_range(b.get("checkin",""), b.get("checkout","")))}'
+                            f'</span></td>'
                         )
                     note_html = ""
                     if note:
@@ -1131,7 +1299,7 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
                                      + html_esc(note) + '</span>')
                     rows_b += (
                         f'<tr>{lead}'
-                        f'<td {td_s}>{html_esc(pmt.get("date",""))}</td>'
+                        f'<td {td_s}>{html_esc(_fmt_date(pmt.get("date","")))}</td>'
                         f'<td {td_s}>{_money(amt)}{note_html}</td>'
                         f'<td class="bonus" {td_s}>{_money(pb)}</td>'
                         f'</tr>'
@@ -1146,10 +1314,43 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
             priced_html = (f'<p style="color:var(--dim)">No payments received in '
                            f'{html_esc(q_label)}.</p>')
 
+        if exp_groups:
+            erows = ""
+            for b, hits, spent, impact in exp_groups:
+                span = len(hits)
+                for i, e in enumerate(hits):
+                    amt = float(e.get("amount") or 0)
+                    note = (e.get("note") or "").strip()
+                    nh = ('<span style="color:var(--dim);font-size:11px"> '
+                          + html_esc(note) + '</span>') if note else ""
+                    lead = ""
+                    if i == 0:
+                        lead = (f'<td {td_s} rowspan="{span}">'
+                                f'{html_esc(b.get("label","?"))}</td>')
+                    erows += (
+                        f'<tr>{lead}'
+                        f'<td {td_s}>{html_esc(_fmt_date(e.get("date","")))}</td>'
+                        f'<td {td_s}>{_money(amt)}{nh}</td>'
+                        f'<td {td_s} style="padding:8px 12px;'
+                        f'border-bottom:1px solid #2a322d;color:var(--err)">'
+                        f'{_money(-round(amt * _BPCT, 2))}</td></tr>'
+                    )
+            expenses_html = (
+                f'<div style="margin-top:20px;overflow-x:auto">'
+                f'<h2 style="font:13px Verdana,sans-serif;text-transform:uppercase;'
+                f'letter-spacing:.1em;color:var(--dim);margin-bottom:8px">Expenses</h2>'
+                f'<table {tbl_s}><thead><tr>'
+                f'<th {th_s}>Reservation</th><th {th_s}>Date</th>'
+                f'<th {th_s}>Amount</th><th {th_s}>Bonus impact</th>'
+                f'</tr></thead><tbody>{erows}</tbody></table></div>'
+            )
+        else:
+            expenses_html = ""
+
         if unpriced_groups:
             up_items = ""
             for b, hits, got in unpriced_groups:
-                dates = ", ".join(f'{html_esc(h.get("date",""))} {_money(float(h.get("amount") or 0))}'
+                dates = ", ".join(f'{html_esc(_fmt_date(h.get("date","")))} {_money(float(h.get("amount") or 0))}'
                                   for h in hits)
                 up_items += (f'<li>{html_esc(b.get("label","?"))}: ${got:,.2f} '
                              f'<span style="color:var(--dim);font-size:11px">'
@@ -1168,9 +1369,10 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
         totals_html = (
             f'<div class="tot" style="margin-top:16px;display:flex;gap:28px;'
             f'flex-wrap:wrap;align-items:baseline">'
-            f'<span>Received: <b>${total_received:,.2f}</b></span>'
+            f'<span>Received: <b>{_money(total_received)}</b></span>'
+            f'<span>Expenses: <b>{_money(total_expenses)}</b></span>'
             f'<span class="bonus" style="font-size:18px">'
-            f'BONUS DUE: <b>${total_bonus:,.2f}</b></span></div>'
+            f'BONUS DUE: <b>{_money(total_bonus)}</b></span></div>'
         )
 
         main_content = (
@@ -1178,7 +1380,7 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
             f'Anya\'s Bonus — {html_esc(q_label)} '
             f'<span style="color:var(--dim);font-size:12px">(cash basis)</span></h2>'
             f'{bonus_nav}'
-            f'<div class="result">{priced_html}{unpriced_html}{totals_html}</div>'
+            f'<div class="result">{priced_html}{expenses_html}{unpriced_html}{totals_html}</div>'
         )
 
     elif tab == "block" and prefill and (prefill.get("edit_id") or "").strip() \
@@ -1268,7 +1470,7 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
                 else:
                     pay_html = (
                         f'<br>Received: ${dep:,.2f}'
-                        f'<br>Outstanding: ${remaining:,.2f}{earned}'
+                        f'<br>Outstanding: ${remaining:,.2f}{_exp_line(b)}{earned}'
                     )
             else:
                 pay_html = ""
@@ -1394,12 +1596,11 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
                 f'<h2>Details</h2>'
                 f'<p style="margin-bottom:4px"><b>{html_esc(b.get("label","?"))}</b><br>'
                 f'Houses: {html_esc(houses_str)}<br>'
-                f'{html_esc(b.get("checkin",""))} → {html_esc(b.get("checkout",""))}'
-                f' ({html_esc(nights_label)})<br>'
-                f'Created by: {html_esc(b.get("created_by",""))}'
-                f'{(" · " + html_esc(created_at_short)) if created_at_short else ""}</p>'
+                f'{html_esc(_fmt_range(b.get("checkin",""), b.get("checkout","")))}<br>'
+                f'{_provenance(b)}</p>'
                 f'{finance_html}'
                 f'{_payments_section(b, kp, confirm_rm)}'
+                f'{_expenses_section(b, kp, confirm_rm)}'
                 f'{notes_html}'
                 f'<div style="border-top:1px solid #2a322d;margin-top:14px;padding-top:12px;'
                 f'display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
@@ -1425,13 +1626,13 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
                 rows += (
                     f'<li style="margin-bottom:8px">'
                     f'<b>{html_esc(b.get("label","?"))}</b>: {html_esc(houses_str)}, '
-                    f'{html_esc(b.get("checkin",""))} → {html_esc(b.get("checkout",""))}'
+                    f'{html_esc(_fmt_range(b.get("checkin",""), b.get("checkout","")))}'
                     f' &nbsp;<a href="{det_url}" style="color:var(--dim);font-size:12px">[details]</a>'
                     f'</li>'
                 )
             blocks_html = f'<ul style="padding-left:20px;margin:8px 0 0">{rows}</ul>'
         else:
-            blocks_html = '<p style="color:var(--dim);margin:8px 0 0">No upcoming blocks.</p>'
+            blocks_html = '<p style="color:var(--dim);margin:8px 0 0">No upcoming reservations.</p>'
 
         # House checkboxes — support prefill for edit / "Block these dates" flow
         house_checks = ""
@@ -1493,7 +1694,7 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
         )
 
         if msg or price_warning:
-            ok = msg.lower().startswith("block") and "conflict" not in msg.lower()
+            ok = msg.lower().startswith("reservation") and "conflict" not in msg.lower()
             msg_color = "var(--ok)" if ok else "var(--err)"
             msg_line = (f'<p style="margin:0;color:{msg_color}">{html_esc(msg)}</p>'
                         if msg else "")
@@ -1509,7 +1710,7 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
 
         edit_id = pf.get("edit_id", "")
         edit_hidden = f'<input type="hidden" name="edit_id" value="{html_esc(edit_id)}">' if edit_id else ""
-        block_btn = "Update block" if edit_id else "Block dates"
+        block_btn = "Update reservation" if edit_id else "Add reservation"
         dates_val = html_esc(pf.get("dates", ""))
         label_val = html_esc(pf.get("label", ""))
         back_href = f"/?key={admin_key}" if admin_key else "/"
@@ -1524,7 +1725,7 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
             f'<input type="hidden" name="action" value="add_block">'
             f'{key_hidden}'
             f'{edit_hidden}'
-            f'<fieldset><legend>{"Edit block" if edit_id else "Block dates"}</legend><div class="row">'
+            f'<fieldset><legend>{"Edit reservation" if edit_id else "Add reservation"}</legend><div class="row">'
             f'<label>Stay <input type="text" id="admin_dates" name="dates" '
             f'placeholder="check-in → check-out" value="{dates_val}" required style="min-width:240px">'
             f'</label></div></fieldset>'
@@ -1538,7 +1739,7 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
             f'<a href="{html_esc(back_href)}" class="btn-sec" style="margin-left:10px">← Calculator</a>'
             f'</form>'
             f'<div class="result" style="margin-top:26px">'
-            f'<h2>Upcoming blocks</h2>'
+            f'<h2>Upcoming reservations</h2>'
             f'{blocks_html}'
             f'</div>'
         )
@@ -1557,7 +1758,7 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
         f'{FLATPICKR_CSS}'
         f'<style>{CSS}</style></head><body><div class="wrap">'
         f'<h1>Zubyria <b>Admin</b></h1>'
-        f'<div class="sub">Date blocks &amp; reservations</div>'
+        f'<div class="sub">Reservations &amp; finances</div>'
         f'{tab_nav}'
         f'{main_content}'
         f'</div>'
@@ -1610,7 +1811,7 @@ def _lambda_handler(event, context):
         if not admin:
             return _resp(200, _access_denied())
 
-        tab = qs.get("tab", "block")
+        tab = _TAB_ALIASES.get(qs.get("tab", "block"), qs.get("tab", "block"))
         action = qs.get("action", "")
         month_str = qs.get("month", "")
         msg = ""
@@ -1725,6 +1926,25 @@ def _lambda_handler(event, context):
                         if _ob.get("sk") == edit_id:
                             carry_payments = [dict(p) for p in _payments_of(_ob)]
                             break
+                carry_expenses = []
+                if edit_id:
+                    for _ob in _get_store().list_blocks():
+                        if _ob.get("sk") == edit_id:
+                            carry_expenses = [dict(e) for e in _expenses_of(_ob)]
+                            break
+                try:
+                    exp_amt = float(qs.get("exp_amount", "") or 0)
+                except ValueError:
+                    exp_amt = 0.0
+                if exp_amt:
+                    _ed = (qs.get("exp_date") or "").strip() or date.today().isoformat()
+                    try:
+                        date.fromisoformat(_ed)
+                    except ValueError:
+                        _ed = date.today().isoformat()
+                    carry_expenses.append(_new_payment(
+                        exp_amt, _ed, qs.get("exp_note", "").strip()))
+
                 if deposit:
                     # Add form only: this is payment #1 for a brand-new booking.
                     carry_payments.append(_new_payment(
@@ -1748,7 +1968,8 @@ def _lambda_handler(event, context):
 
                 r = _get_store().add_block(
                     houses, ci, co, label,
-                    created_by=f"edited from {edit_id}" if edit_id else "admin",
+                    created_by="admin",
+                    edited_from=edit_id or None,
                     exclude_id=edit_id or None,
                     snapshot=snapshot,
                     quote_params=quote_params_out,
@@ -1757,20 +1978,66 @@ def _lambda_handler(event, context):
                     override_subtotal=ov_in or None,
                     price_note=price_note or None,
                     payments=carry_payments or None,
+                    expenses=carry_expenses or None,
                 )
                 if r["ok"]:
                     if edit_id:
                         _get_store().cancel_block(edit_id)
-                        msg = f"Block updated: {label} ({parts[0]} → {parts[1]})"
+                        msg = f"Reservation updated: {label} ({_fmt_range(parts[0], parts[1])})"
                     else:
-                        msg = f"Block added: {label} ({parts[0]} → {parts[1]})"
+                        msg = f"Reservation added: {label} ({_fmt_range(parts[0], parts[1])})"
                     prefill = {}
                 else:
                     conflicts = ", ".join(r["conflicts"])
-                    msg = f"Conflict: those dates are already blocked by: {conflicts}"
+                    msg = f"Conflict: those dates are already taken by: {conflicts}"
             except ValueError as e:
                 msg = f"Error: {e}"
             tab = "block"
+
+        elif action in ("add_expense", "remove_expense"):
+            block_id = qs.get("block_id", "")
+            target = None
+            for b in _get_store().list_blocks():
+                if b.get("sk") == block_id:
+                    target = b
+                    break
+            if not target:
+                msg = "Error: reservation not found."
+            else:
+                ledger = [dict(e) for e in _expenses_of(target)]
+                if action == "remove_expense":
+                    eid = qs.get("expense_id", "")
+                    kept = [e for e in ledger if e.get("id") != eid]
+                    if len(kept) == len(ledger):
+                        msg = "Error: expense not found."
+                    else:
+                        _get_store().set_expenses(block_id, kept)
+                        msg = "Expense removed."
+                else:
+                    try:
+                        amt = float(qs.get("amount", "") or 0)
+                    except ValueError:
+                        amt = 0.0
+                    edate = (qs.get("exp_date", "") or "").strip() or date.today().isoformat()
+                    try:
+                        date.fromisoformat(edate)
+                    except ValueError:
+                        edate = ""
+                    if not amt:
+                        msg = "Error: enter an expense amount."
+                    elif not edate:
+                        msg = "Error: enter a valid expense date."
+                    else:
+                        ledger.append(_new_payment(amt, edate, qs.get("exp_note", "").strip()))
+                        _get_store().set_expenses(block_id, ledger)
+                        msg = f"Expense of {_money(amt)} recorded."
+            tab = "block"
+            if qs.get("back") == "edit":
+                qs = dict(qs, edit_id=block_id)
+                prefill = dict(qs)
+                action = ""
+            elif not qs.get("details"):
+                qs = dict(qs, details=block_id)
 
         elif action in ("add_payment", "remove_payment"):
             block_id = qs.get("block_id", "")
@@ -1780,7 +2047,7 @@ def _lambda_handler(event, context):
                     target = b
                     break
             if not target:
-                msg = "Error: block not found."
+                msg = "Error: reservation not found."
             else:
                 # Derive from the migrated view, so a legacy deposit is materialised
                 # into the ledger by the first write rather than silently dropped.
@@ -1827,9 +2094,9 @@ def _lambda_handler(event, context):
                     target = b
                     break
             if not target:
-                msg = "Error: block not found."
+                msg = "Error: reservation not found."
             elif not target.get("snapshot"):
-                msg = "Error: this block has no price to override."
+                msg = "Error: this reservation has no price to override."
             elif action == "revert_price":
                 _get_store().set_price_override(
                     block_id, _revert_override(target["snapshot"]), None, None)
@@ -1867,7 +2134,7 @@ def _lambda_handler(event, context):
             if block_id:
                 try:
                     _get_store().cancel_block(block_id)
-                    msg = "Block cancelled."
+                    msg = "Reservation cancelled."
                 except Exception as e:
                     msg = f"Error cancelling: {e}"
             tab = "block"

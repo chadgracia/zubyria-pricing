@@ -61,7 +61,7 @@ class FakeStore:
     def add_block(self, houses, checkin, checkout, label, created_by="admin",
                   exclude_id=None, snapshot=None, quote_params=None, btype=None,
                   notes=None, deposit=None, override_subtotal=None, price_note=None,
-                  payments=None):
+                  payments=None, expenses=None, edited_from=None):
         ci_d = checkin if isinstance(checkin, date) else date.fromisoformat(str(checkin))
         co_d = checkout if isinstance(checkout, date) else date.fromisoformat(str(checkout))
         conflicts = []
@@ -102,6 +102,10 @@ class FakeStore:
             item["deposit"] = deposit
         if payments is not None:
             item["payments"] = payments
+        if expenses is not None:
+            item["expenses"] = expenses
+        if edited_from:
+            item["edited_from"] = edited_from
         if override_subtotal:
             item["override_subtotal"] = override_subtotal
         if price_note:
@@ -113,6 +117,11 @@ class FakeStore:
         for b in self._blocks:
             if b.get("sk") == block_id:
                 b["payments"] = payments
+
+    def set_expenses(self, block_id, expenses):
+        for b in self._blocks:
+            if b.get("sk") == block_id:
+                b["expenses"] = expenses
 
     def set_price_override(self, block_id, snapshot, override_subtotal, price_note):
         for b in self._blocks:
@@ -176,7 +185,7 @@ r = lambda_function.lambda_handler(ev("/admin", {
     "dates": "2026-09-10 to 2026-09-15",
     "h_tseglina": "on", "label": "Test Guest",
 }), None)
-t("5: add_block success", "Block added" in r["body"])
+t("5: add_block success", "Reservation added" in r["body"])
 
 # 6 – cancel_block works
 _store6 = FakeStore([{
@@ -201,7 +210,8 @@ r = lambda_function.lambda_handler(ev("/admin", {
     "jacuzzi": "2", "btype": "airbnb",
 }), None)
 t("7: admin price tab shows Anya", "Anya" in r["body"])
-t("7: admin price tab has BLOCK|PRICE nav", "Block" in r["body"] and "Price" in r["body"])
+t("7: admin tabs render the new names",
+  "Reservations" in r["body"] and "Pricing" in r["body"] and "Finances" in r["body"])
 
 # 8 – Public page form action is "/"
 lambda_function._store = FakeStore()
@@ -343,7 +353,7 @@ r = lambda_function.lambda_handler(ev("/admin", {
     "dates": "2026-09-11 to 2026-09-14",
     "h_tseglina": "on", "label": "Original Guest",
 }), None)
-t("AT1: edit success (no self-conflict)", "Block updated" in r["body"] or "Block added" in r["body"])
+t("AT1: edit success (no self-conflict)", "Reservation updated" in r["body"] or "Reservation added" in r["body"])
 t("AT1: original block cancelled", _store_at1._blocks[0]["status"] == "cancelled")
 t("AT1: new active block for new dates",
   any(b["status"] == "active" and b.get("checkin") == "2026-09-11" for b in _store_at1._blocks))
@@ -972,7 +982,7 @@ r_nd2 = lambda_function.lambda_handler(ev("/admin", {
     "h_tseglina": "on", "label": "Notes Guest",
     "notes": "Late arrival <script>alert(1)</script> & pets",
 }), None)
-t("AT_nd2: add_block with notes succeeds", "Block added" in r_nd2["body"])
+t("AT_nd2: add_block with notes succeeds", "Reservation added" in r_nd2["body"])
 _nd2_item = [b for b in _store_nd2._blocks if b.get("label") == "Notes Guest"][0]
 t("AT_nd2: notes stored on the item",
   _nd2_item.get("notes") == "Late arrival <script>alert(1)</script> & pets")
@@ -1285,7 +1295,7 @@ r_ov8 = lambda_function.lambda_handler(ev("/admin", {
     "btype": "airbnb", "g_tseglina": "4",
     "override_subtotal": "3000.0", "price_note": "friend discount",
 }), None)
-t("AT_ov8: edit succeeds", "Block updated" in r_ov8["body"])
+t("AT_ov8: edit succeeds", "Reservation updated" in r_ov8["body"])
 t("AT_ov8: warning shown that the custom price predates the change",
   "kept from before this change" in r_ov8["body"])
 _new_ov8 = [b for b in _store_ov8._blocks
@@ -1385,7 +1395,8 @@ _store_pl1 = FakeStore([_pl_block(_two)])
 body_pl1 = _q(_store_pl1, 4)
 t("AT_pl1: Q4 received totals 3625", "Received: <b>$3,625.00</b>" in body_pl1)
 t("AT_pl1: Q4 bonus due totals 568.40", "BONUS DUE: <b>$568.40</b>" in body_pl1)
-t("AT_pl1: both payments listed", "2026-10-05" in body_pl1 and "2026-11-20" in body_pl1)
+t("AT_pl1: both payments listed in readable form",
+  "Oct 5th, 2026" in body_pl1 and "Nov 20th, 2026" in body_pl1)
 t("AT_pl1: payments grouped under one booking", body_pl1.count("Ledger Guest") == 1)
 t("AT_pl1: first payment accrues 156.80", "$156.80" in body_pl1)
 t("AT_pl1: second payment accrues 411.60", "$411.60" in body_pl1)
@@ -1402,10 +1413,10 @@ t("AT_pl2: outstanding is subtotal minus received", _out == 2625.0)
 # AT_pl3 – a payment dated Q1 2027 appears only in that quarter
 _store_pl3 = FakeStore([_pl_block(
     _two + [{"id": "c", "date": "2027-02-10", "amount": 500.0, "note": "late"}])])
-t("AT_pl3: Q1-2027 payment absent from Q4-2026", "2027-02-10" not in _q(_store_pl3, 4))
+t("AT_pl3: Q1-2027 payment absent from Q4-2026", "Feb 10th, 2027" not in _q(_store_pl3, 4))
 _body_q1 = _q(_store_pl3, 1, 2027)
-t("AT_pl3: Q1-2027 payment present in its own quarter", "2027-02-10" in _body_q1)
-t("AT_pl3: Q1-2027 shows only that payment", "2026-10-05" not in _body_q1)
+t("AT_pl3: Q1-2027 payment present in its own quarter", "Feb 10th, 2027" in _body_q1)
+t("AT_pl3: Q1-2027 shows only that payment", "Oct 5th, 2026" not in _body_q1)
 t("AT_pl3: Q1-2027 totals only that payment", "Received: <b>$500.00</b>" in _body_q1)
 
 # AT_pl4 – legacy deposit migrates to payment #1, totals intact
@@ -1435,7 +1446,7 @@ r_pl5 = lambda_function.lambda_handler(ev("/admin", {
     "edit_id": "block#pl", "dates": "2026-09-20 to 2026-09-24",
     "h_tseglina": "on", "label": "Ledger Guest",
 }), None)
-t("AT_pl5: edit succeeds", "Block updated" in r_pl5["body"])
+t("AT_pl5: edit succeeds", "Reservation updated" in r_pl5["body"])
 _new_pl5 = [b for b in _store_pl5._blocks
             if b.get("status") == "active" and b.get("checkin") == "2026-09-20"][0]
 t("AT_pl5: both payments carried onto the new item",
@@ -1595,11 +1606,12 @@ def _active(store, checkin):
 _store_ue1 = FakeStore([_pl_block(_two)])
 body_ue1 = _edit(_store_ue1, "block#pl")
 t("AT_ue1: stay section present", "1 · Stay" in body_ue1)
-t("AT_ue1: price section present", "2 · Price" in body_ue1)
+t("AT_ue1: pricing section present", "2 · Pricing" in body_ue1)
 t("AT_ue1: payments section present", "3 · Payments" in body_ue1)
 t("AT_ue1: stay fields prefilled", 'value="2026-09-10 to 2026-09-13"' in body_ue1)
 t("AT_ue1: label prefilled", 'value="Ledger Guest"' in body_ue1)
-t("AT_ue1: existing payments listed", "2026-10-05" in body_ue1 and "2026-11-20" in body_ue1)
+t("AT_ue1: existing payments listed in readable form",
+  "Oct 5th, 2026" in body_ue1 and "Nov 20th, 2026" in body_ue1)
 t("AT_ue1: received/outstanding shown", "Received:" in body_ue1 and "Outstanding:" in body_ue1)
 t("AT_ue1: add-payment row present", 'name="pay_amount"' in body_ue1)
 t("AT_ue1: pricing controls are NOT hidden behind a disclosure",
@@ -1620,7 +1632,7 @@ t("AT_ue2: unpriced block prompts for a booking type",
 r_ue2 = _save(_store_ue2, "block#unp2",
               dates="2026-09-10 to 2026-09-13", h_tseglina="on",
               label="Was Unpriced", btype="cash", g_tseglina="4")
-t("AT_ue2: save succeeds", "Block updated" in r_ue2["body"])
+t("AT_ue2: save succeeds", "Reservation updated" in r_ue2["body"])
 _new_ue2 = _active(_store_ue2, "2026-09-10")
 t("AT_ue2: snapshot now exists", bool(_new_ue2.get("snapshot")))
 t("AT_ue2: snapshot has a subtotal", _new_ue2["snapshot"]["subtotal"] > 0)
@@ -1677,7 +1689,7 @@ _store_ue5 = FakeStore([_pl_block([_two[0]])])
 r_ue5 = _save(_store_ue5, "block#pl", dates="2026-09-10 to 2026-09-13",
               h_tseglina="on", label="Ledger Guest", btype="cash",
               pay_amount="2625", pay_date="2026-11-20", pay_note="balance")
-t("AT_ue5: save succeeds", "Block updated" in r_ue5["body"])
+t("AT_ue5: save succeeds", "Reservation updated" in r_ue5["body"])
 _n5 = _active(_store_ue5, "2026-09-10")
 t("AT_ue5: payment appended to the ledger", len(_n5["payments"]) == 2)
 t("AT_ue5: carried payment kept", any(p["amount"] == 1000.0 for p in _n5["payments"]))
@@ -1689,7 +1701,7 @@ _edit5 = _edit(_store_ue5, _n5["sk"])
 t("AT_ue5: edit screen reflects the new totals", "$3,625.00" in _edit5)
 _q5 = lambda_function.lambda_handler(ev("/admin", {
     "key": ADMIN_SECRET, "tab": "bonus", "q": "4", "year": "2026"}), None)["body"]
-t("AT_ue5: payment appears in the quarterly bonus report", "2026-11-20" in _q5)
+t("AT_ue5: payment appears in the quarterly finances report", "Nov 20th, 2026" in _q5)
 _ratio5 = lambda_function._bonus_ratio(_n5)
 t("AT_ue5: quarterly bonus accrues at the re-derived ratio",
   f"${round(2625.0 * _ratio5, 2):,.2f}" in _q5)
@@ -1769,6 +1781,198 @@ r_ue8 = lambda_function.lambda_handler(ev("/admin", {
     "tab": "block", "edit_id": "block#pl"}), None)
 t("AT_ue8: non-admin denied the edit screen",
   "Access denied" in r_ue8["body"] and "1 · Stay" not in r_ue8["body"])
+
+# ── AT_tx: terminology, dates, provenance, expenses ──────────────────────────
+
+print("\n=== Terminology / dates / expenses tests ===")
+
+# AT_tx1 – ordinal date helper across every suffix rule
+_ORD = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th", 11: "11th", 12: "12th",
+        13: "13th", 21: "21st", 22: "22nd", 23: "23rd", 31: "31st"}
+_ord_ok = all(lambda_function._ord(n) == want for n, want in _ORD.items())
+t("AT_tx1: ordinals correct incl. the 11/12/13 exceptions", _ord_ok)
+t("AT_tx1: date formats as 'Aug 14th, 2026'",
+  lambda_function._fmt_date("2026-08-14") == "Aug 14th, 2026")
+t("AT_tx1: same-year range omits the first year",
+  lambda_function._fmt_range("2026-08-14", "2026-08-16")
+  == "Aug 14th → Aug 16th, 2026 (2 nights)")
+t("AT_tx1: cross-year range shows both years",
+  lambda_function._fmt_range("2026-12-30", "2027-01-02")
+  == "Dec 30th, 2026 → Jan 2nd, 2027 (3 nights)")
+t("AT_tx1: single night is singular",
+  "(1 night)" in lambda_function._fmt_range("2026-08-14", "2026-08-15"))
+t("AT_tx1: bad input degrades rather than raising",
+  lambda_function._fmt_date("") == "" and lambda_function._fmt_date("nope") == "nope")
+
+# AT_tx2 – no raw sk in VISIBLE text (ids still travel in URLs and hidden inputs,
+# exactly as ISO dates still travel in URLs)
+def _visible(html):
+    return _re.sub(r"<[^>]+>", " ", html)
+
+_store_tx2 = FakeStore([dict(_pl_block(_two), sk="block#SENTINELSK",
+                             edited_from="block#OLDSENTINEL")])
+lambda_function._store = _store_tx2
+_det_tx2 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "details": "block#SENTINELSK"}), None)["body"]
+_edt_tx2 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "edit_id": "block#SENTINELSK"}), None)["body"]
+t("AT_tx2: details renders no raw sk in visible text",
+  "SENTINELSK" not in _visible(_det_tx2))
+t("AT_tx2: details renders no lineage id in visible text",
+  "OLDSENTINEL" not in _visible(_det_tx2))
+t("AT_tx2: edit renders no raw sk in visible text",
+  "SENTINELSK" not in _visible(_edt_tx2))
+t("AT_tx2: 'edited from' phrasing is gone", "edited from" not in _det_tx2.lower())
+t("AT_tx2: edited record shows human provenance", "Edited " in _det_tx2)
+_store_tx2b = FakeStore([dict(_pl_block(_two), created_at="2026-08-14T10:00:00",
+                              created_by="Anya")])
+_det_tx2b = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "details": "block#pl"}), None)["body"] \
+    if (lambda_function.__dict__.__setitem__("_store", _store_tx2b) or True) else ""
+t("AT_tx2: original record shows 'Created <date> by <name>'",
+  "Created Aug 14th, 2026 by Anya" in _det_tx2b)
+
+# AT_tx3 – tabs render new names; old query params still route
+_store_tx3 = FakeStore()
+lambda_function._store = _store_tx3
+_nav = lambda_function.lambda_handler(ev("/admin", {"key": ADMIN_SECRET}), None)["body"]
+t("AT_tx3: tabs read Reservations / Pricing / Finances",
+  ">Reservations</a>" in _nav and ">Pricing</a>" in _nav and ">Finances</a>" in _nav)
+t("AT_tx3: old tab names gone from the nav",
+  ">Block</a>" not in _nav and ">Bonus</a>" not in _nav)
+for _old, _marker in (("block", "Add reservation"), ("price", "Booking type"),
+                      ("bonus", "BONUS DUE")):
+    _b = lambda_function.lambda_handler(ev("/admin", {
+        "key": ADMIN_SECRET, "tab": _old}), None)["body"]
+    t(f"AT_tx3: bookmarked ?tab={_old} still routes", _marker in _b)
+for _new, _marker in (("reservations", "Add reservation"), ("pricing", "Booking type"),
+                      ("finances", "BONUS DUE")):
+    _b = lambda_function.lambda_handler(ev("/admin", {
+        "key": ADMIN_SECRET, "tab": _new}), None)["body"]
+    t(f"AT_tx3: new alias ?tab={_new} routes too", _marker in _b)
+
+# AT_tx4 – expense 200 against a quarter accruing 568.40 → bonus due 528.40
+_store_tx4 = FakeStore([_pl_block(
+    _two, expenses=[{"id": "e1", "date": "2026-11-25", "amount": 200.0,
+                     "note": "linens"}])])
+body_tx4 = _q(_store_tx4, 4)
+t("AT_tx4: per-payment accruals unchanged by the expense",
+  "$156.80" in body_tx4 and "$411.60" in body_tx4)
+t("AT_tx4: expenses total shown", "Expenses: <b>$200.00</b>" in body_tx4)
+t("AT_tx4: bonus impact shown as a negative", "-$40.00" in body_tx4)
+t("AT_tx4: BONUS DUE is net of the expense", "BONUS DUE: <b>$528.40</b>" in body_tx4)
+t("AT_tx4: expense listed under its own heading", ">Expenses</h2>" in body_tx4)
+t("AT_tx4: expense note shown", "linens" in body_tx4)
+t("AT_tx4: expense date readable", "Nov 25th, 2026" in body_tx4)
+t("AT_tx4: received unaffected by the expense",
+  "Received: <b>$3,625.00</b>" in body_tx4)
+
+# AT_tx5 – an expense out of quarter does not touch that quarter's bonus
+_store_tx5 = FakeStore([_pl_block(
+    _two, expenses=[{"id": "e1", "date": "2027-01-05", "amount": 200.0, "note": "x"}])])
+t("AT_tx5: out-of-quarter expense leaves Q4 bonus whole",
+  "BONUS DUE: <b>$568.40</b>" in _q(_store_tx5, 4))
+t("AT_tx5: it lands in its own quarter instead",
+  "-$40.00" in _q(_store_tx5, 1, 2027))
+
+# AT_tx6 – a negative expense (refunded cost) adds bonus back
+_store_tx6 = FakeStore([_pl_block(_two, expenses=[
+    {"id": "e1", "date": "2026-11-25", "amount": 200.0, "note": "linens"},
+    {"id": "e2", "date": "2026-11-26", "amount": -50.0, "note": "returned"}])])
+body_tx6 = _q(_store_tx6, 4)
+t("AT_tx6: negative expense accepted", "-$50.00" in body_tx6)
+t("AT_tx6: expenses total nets to 150", "Expenses: <b>$150.00</b>" in body_tx6)
+t("AT_tx6: bonus due adds the refund back",
+  "BONUS DUE: <b>$538.40</b>" in body_tx6)
+
+# AT_tx7 – expenses never change what the guest owes
+_b_noexp = _pl_block([_two[0]])
+_b_exp = _pl_block([_two[0]], expenses=[
+    {"id": "e1", "date": "2026-11-25", "amount": 500.0, "note": "big cost"}])
+t("AT_tx7: outstanding identical with and without expenses",
+  lambda_function._payment_state(_b_noexp)[1]
+  == lambda_function._payment_state(_b_exp)[1] == 2625.0)
+t("AT_tx7: received identical too",
+  lambda_function._payment_state(_b_exp)[0] == 1000.0)
+lambda_function._store = FakeStore([_b_exp])
+_det_tx7 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "details": "block#pl"}), None)["body"]
+t("AT_tx7: details shows the expenses total", "Expenses: $500.00" in _det_tx7)
+t("AT_tx7: details still shows the full outstanding", "Outstanding: $2,625.00" in _det_tx7)
+
+# AT_tx8 – expense ledger survives a stay edit, and add/remove work
+_store_tx8 = FakeStore([_pl_block(_two, expenses=[
+    {"id": "e1", "date": "2026-11-25", "amount": 200.0, "note": "linens"}])])
+r_tx8 = _save(_store_tx8, "block#pl", dates="2026-09-20 to 2026-09-24",
+              h_tseglina="on", label="Ledger Guest")
+t("AT_tx8: edit succeeds", "Reservation updated" in r_tx8["body"])
+_n_tx8 = _active(_store_tx8, "2026-09-20")
+t("AT_tx8: expense carried onto the recreated record",
+  len(_n_tx8.get("expenses", [])) == 1 and _n_tx8["expenses"][0]["amount"] == 200.0)
+t("AT_tx8: payments still carried alongside", len(_n_tx8.get("payments", [])) == 2)
+lambda_function._store = _store_tx8
+r_tx8b = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "action": "add_expense",
+    "block_id": _n_tx8["sk"], "amount": "75", "exp_date": "2026-12-01",
+    "exp_note": "cleaning supplies"}), None)
+t("AT_tx8: expense added from details", "Expense of $75.00 recorded" in r_tx8b["body"])
+_n_tx8b = [x for x in _store_tx8._blocks if x["sk"] == _n_tx8["sk"]][0]
+t("AT_tx8: ledger now has two expenses", len(_n_tx8b["expenses"]) == 2)
+_eid8 = [e["id"] for e in _n_tx8b["expenses"] if e["amount"] == 75.0][0]
+lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "action": "remove_expense",
+    "block_id": _n_tx8["sk"], "expense_id": _eid8}), None)
+t("AT_tx8: expense removed",
+  len([x for x in _store_tx8._blocks if x["sk"] == _n_tx8["sk"]][0]["expenses"]) == 1)
+
+# AT_tx9 – conflicting save writes no expense either; Decimal-safe storage
+_store_tx9 = FakeStore([
+    _pl_block(_two),
+    {"pk": "blocks", "sk": "block#blk9", "houses": ["tseglina"],
+     "checkin": "2026-09-20", "checkout": "2026-09-25", "label": "Blocker",
+     "created_by": "admin", "status": "active"},
+])
+r_tx9 = _save(_store_tx9, "block#pl", dates="2026-09-21 to 2026-09-24",
+              h_tseglina="on", label="Ledger Guest", exp_amount="300")
+t("AT_tx9: conflict rejects the save", "Conflict" in r_tx9["body"])
+t("AT_tx9: no expense written on conflict",
+  _expenses_len := len([x for x in _store_tx9._blocks
+                        if x["sk"] == "block#pl"][0].get("expenses", [])) == 0)
+_strict_tx = StrictDynamoTable()
+_store_tx9b = Store(_strict_tx)
+_store_tx9b.add_block(
+    houses=["tseglina"], checkin=date(2026, 11, 1), checkout=date(2026, 11, 4),
+    label="Expense decimal",
+    expenses=[{"id": "e", "date": "2026-11-02", "amount": 200.75, "note": "n"}])
+_sk_tx = _store_tx9b.list_blocks()[0]["sk"]
+_store_tx9b.set_expenses(_sk_tx, [
+    {"id": "e", "date": "2026-11-02", "amount": 200.75, "note": "n"},
+    {"id": "f", "date": "2026-11-03", "amount": 19.25, "note": "m"}])
+_read_tx = _store_tx9b.list_blocks()[0]
+t("AT_tx9: expenses survive a float-rejecting table",
+  len(_read_tx["expenses"]) == 2)
+t("AT_tx9: amounts read back as native floats",
+  _read_tx["expenses"][0]["amount"] == 200.75
+  and not isinstance(_read_tx["expenses"][0]["amount"], Decimal))
+t("AT_tx9: expense total sums correctly",
+  lambda_function._expense_total(_read_tx) == 220.0)
+
+# AT_tx10 – edit screen exposes the Expenses section; non-admin sees none of it
+lambda_function._store = _store_tx8
+_edt_tx10 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "edit_id": _n_tx8["sk"]}), None)["body"]
+t("AT_tx10: edit screen has an Expenses section", "4 · Expenses" in _edt_tx10)
+t("AT_tx10: expenses sit under payments",
+  _edt_tx10.index("3 · Payments") < _edt_tx10.index("4 · Expenses"))
+t("AT_tx10: add-expense row present", 'name="exp_amount"' in _edt_tx10)
+t("AT_tx10: expenses total shown on the edit screen",
+  "Expenses: <b>$200.00</b>" in _edt_tx10)
+_r_tx10n = lambda_function.lambda_handler(ev("/admin", {
+    "tab": "block", "action": "add_expense", "block_id": _n_tx8["sk"],
+    "amount": "999"}), None)
+t("AT_tx10: non-admin cannot add an expense",
+  "Access denied" in _r_tx10n["body"]
+  and len([x for x in _store_tx8._blocks if x["sk"] == _n_tx8["sk"]][0]["expenses"]) == 1)
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 print()
