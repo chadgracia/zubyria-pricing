@@ -87,7 +87,7 @@ class Store:
     def add_block(self, houses, checkin, checkout, label, created_by="admin",
                   exclude_id=None, snapshot=None, quote_params=None, btype=None,
                   notes=None, deposit=None, override_subtotal=None, price_note=None,
-                  payments=None, expenses=None, edited_from=None):
+                  payments=None, expenses=None, edited_from=None, source=None):
         """Check availability for the given houses (excluding exclude_id block); if any conflict,
         return {"ok": False, "conflicts": [label, ...]} without writing.
         On success write the item and return {"ok": True, "id": sk}."""
@@ -118,6 +118,9 @@ class Store:
             item["btype"] = btype
         if notes:
             item["notes"] = notes
+        if source:
+            # Booking channel. Optional, so a blank one is simply absent from the item.
+            item["source"] = source
         if deposit:
             # Legacy scalar, kept only so old items still read; the ledger is truth.
             item["deposit"] = deposit
