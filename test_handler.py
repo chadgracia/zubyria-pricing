@@ -61,7 +61,7 @@ class FakeStore:
     def add_block(self, houses, checkin, checkout, label, created_by="admin",
                   exclude_id=None, snapshot=None, quote_params=None, btype=None,
                   notes=None, deposit=None, override_subtotal=None, price_note=None,
-                  payments=None, expenses=None, edited_from=None):
+                  payments=None, expenses=None, edited_from=None, source=None):
         ci_d = checkin if isinstance(checkin, date) else date.fromisoformat(str(checkin))
         co_d = checkout if isinstance(checkout, date) else date.fromisoformat(str(checkout))
         conflicts = []
@@ -98,6 +98,8 @@ class FakeStore:
             item["btype"] = btype
         if notes:
             item["notes"] = notes
+        if source:
+            item["source"] = source
         if deposit:
             item["deposit"] = deposit
         if payments is not None:
@@ -152,6 +154,18 @@ def ev(path="/", qs=None, cookies=None):
 def admin_cookie():
     return [f"zadmin={ADMIN_SECRET}"]
 
+def calc_price(ci, co, bookings, btype="cash", **kw):
+    """What the pricing engine charges for these inputs, as a form value.
+
+    Submitting this as the rental fee is how a test says "no override" — exactly
+    what the form does when the calculated figure is left alone.
+    """
+    from pricing_engine import quote as _quote
+    q = _quote(date.fromisoformat(ci), date.fromisoformat(co), bookings,
+               booking_type=btype, **kw)
+    return f"{q.subtotal:.2f}"
+
+
 def t(name, cond):
     global _passed, _failed
     if cond:
@@ -189,7 +203,7 @@ lambda_function._store = FakeStore()
 r = lambda_function.lambda_handler(ev("/admin", {
     "key": ADMIN_SECRET, "tab": "block", "action": "add_block",
     "dates": "2026-09-10 to 2026-09-15",
-    "h_tseglina": "on", "label": "Test Guest",
+    "h_tseglina": "on", "label": "Test Guest", "rental_fee": "600",
 }), None)
 t("5: add_block success", "Reservation added" in r["body"])
 
@@ -357,7 +371,7 @@ r = lambda_function.lambda_handler(ev("/admin", {
     "key": ADMIN_SECRET, "tab": "block", "action": "add_block",
     "edit_id": "block#A",
     "dates": "2026-09-11 to 2026-09-14",
-    "h_tseglina": "on", "label": "Original Guest",
+    "h_tseglina": "on", "label": "Original Guest", "rental_fee": "600",
 }), None)
 t("AT1: edit success (no self-conflict)", "Reservation updated" in r["body"] or "Reservation added" in r["body"])
 t("AT1: original marked superseded, not cancelled",
@@ -384,7 +398,7 @@ r = lambda_function.lambda_handler(ev("/admin", {
     "key": ADMIN_SECRET, "tab": "block", "action": "add_block",
     "edit_id": "block#A",
     "dates": "2026-09-11 to 2026-09-14",
-    "h_tseglina": "on", "label": "Block A",
+    "h_tseglina": "on", "label": "Block A", "rental_fee": "600",
 }), None)
 t("AT1: conflict names Block B", "Block B" in r["body"])
 t("AT1: Block A unchanged on conflict", _store_at1b._blocks[0]["status"] == "active")
@@ -397,6 +411,8 @@ lambda_function.lambda_handler(ev("/admin", {
     "dates": "2026-08-10 to 2026-08-13",
     "h_tseglina": "on", "label": "Priced Guest",
     "btype": "airbnb", "g_tseglina": "4", "jacuzzi": "0", "pets": "0",
+    "rental_fee": calc_price("2026-08-10", "2026-08-13", {"tseglina": 4},
+                             btype="airbnb"),
 }), None)
 priced_block = _store_at2._blocks[0] if _store_at2._blocks else {}
 t("AT2: snapshot stored on priced block", "snapshot" in priced_block)
@@ -408,10 +424,15 @@ lambda_function._store = _store_at2b
 lambda_function.lambda_handler(ev("/admin", {
     "key": ADMIN_SECRET, "tab": "block", "action": "add_block",
     "dates": "2026-08-14 to 2026-08-17",
-    "h_tseglina": "on", "label": "Maintenance",
+    "h_tseglina": "on", "label": "Maintenance", "rental_fee": "450",
 }), None)
 plain_block = _store_at2b._blocks[0] if _store_at2b._blocks else {}
-t("AT2: no snapshot on plain block", "snapshot" not in plain_block)
+t("AT2: block saved without a booking type still carries a snapshot",
+  "snapshot" in plain_block)
+t("AT2: its price is the rental fee alone",
+  plain_block["snapshot"]["subtotal"] == 450.0)
+t("AT2: no calculator params on a block priced by fee alone",
+  "quote_params" not in plain_block)
 
 # AT3 – Re-price on edit: snapshot reflects new dates (holiday night raises bonus)
 _store_at3 = FakeStore([{
@@ -426,6 +447,7 @@ lambda_function.lambda_handler(ev("/admin", {
     "dates": "2026-08-23 to 2026-08-26",   # includes Independence Day Aug 24
     "h_tseglina": "on", "label": "Reprice Test",
     "btype": "cash", "g_tseglina": "2",
+    "rental_fee": calc_price("2026-08-23", "2026-08-26", {"tseglina": 2}),
 }), None)
 t("AT3: original superseded on edit", _store_at3._blocks[0]["status"] == "superseded")
 new_b3 = next((b for b in _store_at3._blocks if b.get("status") == "active"), None)
@@ -721,7 +743,7 @@ lambda_function._store = BrokenAddStore()
 r_d3 = lambda_function.lambda_handler(ev("/admin", {
     "key": ADMIN_SECRET, "tab": "block", "action": "add_block",
     "dates": "2026-11-05 to 2026-11-08",
-    "h_tseglina": "on", "label": "Crash test",
+    "h_tseglina": "on", "label": "Crash test", "rental_fee": "600",
 }), None)
 t("AT_D3: unhandled exception → 500", r_d3["statusCode"] == 500)
 t("AT_D3: 500 body is HTML error page", "internal error" in r_d3["body"].lower())
@@ -795,7 +817,7 @@ lambda_function._store = _store_hd2
 r_hd2_conflict = lambda_function.lambda_handler(ev("/admin", {
     "key": ADMIN_SECRET, "tab": "block", "action": "add_block",
     "dates": "2026-08-12 to 2026-08-16",
-    "h_tseglina": "on", "label": "Conflict test",
+    "h_tseglina": "on", "label": "Conflict test", "rental_fee": "600",
 }), None)
 t("AT_hd2: conflict detection still works", "Conflict" in r_hd2_conflict["body"])
 
@@ -988,7 +1010,7 @@ lambda_function._store = _store_nd2
 r_nd2 = lambda_function.lambda_handler(ev("/admin", {
     "key": ADMIN_SECRET, "tab": "block", "action": "add_block",
     "dates": "2026-09-10 to 2026-09-13",
-    "h_tseglina": "on", "label": "Notes Guest",
+    "h_tseglina": "on", "label": "Notes Guest", "rental_fee": "600",
     "notes": "Late arrival <script>alert(1)</script> & pets",
 }), None)
 t("AT_nd2: add_block with notes succeeds", "Reservation added" in r_nd2["body"])
@@ -1229,12 +1251,15 @@ t("AT_ov3: recomputed commission shown", "Airbnb commission: $465.00" in body_ov
 t("AT_ov3: recomputed gross profit shown", "Gross profit: $2,335.00" in body_ov3)
 t("AT_ov3: recomputed bonus shown", "$467.00" in body_ov3)
 t("AT_ov3: airbnb listing price shown", "List at: $3,550.30" in body_ov3)
+# The panel itself must carry no price controls. Sliced at the Done link because
+# the page below it is the add-reservation form, which does have a fee field.
+_panel_ov3 = body_ov3.split(">Done</a>")[0]
 t("AT_ov3: details is read-only — price form lives on the Edit screen",
-  ">Edit price</summary>" not in body_ov3 and 'name="final_price"' not in body_ov3)
+  ">Edit price</summary>" not in _panel_ov3 and 'name="rental_fee"' not in _panel_ov3)
 t("AT_ov3: details links to the Edit screen", "edit_id=" in body_ov3)
 _ov3_edit = lambda_function.lambda_handler(ev("/admin", {
     "key": ADMIN_SECRET, "tab": "block", "edit_id": "block#ov"}), None)["body"]
-t("AT_ov3: edit screen exposes the final-price field", 'name="final_price"' in _ov3_edit)
+t("AT_ov3: edit screen exposes the rental-fee field", 'name="rental_fee"' in _ov3_edit)
 t("AT_ov3: edit screen prefills the override amount", 'value="3000.00"' in _ov3_edit)
 t("AT_ov3: revert control on the Edit screen", "Revert to calculated" in _ov3_edit)
 
@@ -1302,7 +1327,7 @@ r_ov8 = lambda_function.lambda_handler(ev("/admin", {
     "dates": "2026-09-20 to 2026-09-24",          # different dates
     "h_tseglina": "on", "label": "Override Guest",
     "btype": "airbnb", "g_tseglina": "4",
-    "override_subtotal": "3000.0", "price_note": "friend discount",
+    "rental_fee": "3000.0", "price_note": "friend discount",
 }), None)
 t("AT_ov8: edit succeeds", "Reservation updated" in r_ov8["body"])
 t("AT_ov8: warning shown that the custom price predates the change",
@@ -1453,7 +1478,7 @@ lambda_function._store = _store_pl5
 r_pl5 = lambda_function.lambda_handler(ev("/admin", {
     "key": ADMIN_SECRET, "tab": "block", "action": "add_block",
     "edit_id": "block#pl", "dates": "2026-09-20 to 2026-09-24",
-    "h_tseglina": "on", "label": "Ledger Guest",
+    "h_tseglina": "on", "label": "Ledger Guest", "rental_fee": "3625",
 }), None)
 t("AT_pl5: edit succeeds", "Reservation updated" in r_pl5["body"])
 _new_pl5 = [b for b in _store_pl5._blocks
@@ -1480,6 +1505,7 @@ r_pl6 = lambda_function.lambda_handler(ev("/admin", {
     "key": ADMIN_SECRET, "tab": "block", "action": "add_block",
     "edit_id": "block#pl", "dates": "2026-09-21 to 2026-09-24",
     "h_tseglina": "on", "label": "Ledger Guest", "deposit": "750",
+    "rental_fee": "3625",
 }), None)
 t("AT_pl6: conflicting edit rejected naming the blocker",
   "Conflict" in r_pl6["body"] and "Blocker" in r_pl6["body"])
@@ -1564,7 +1590,7 @@ lambda_function._store = _store_pl11
 lambda_function.lambda_handler(ev("/admin", {
     "key": ADMIN_SECRET, "tab": "block", "action": "add_block",
     "dates": "2026-09-10 to 2026-09-13", "h_tseglina": "on",
-    "label": "New Guest", "deposit": "500"}), None)
+    "label": "New Guest", "deposit": "500", "rental_fee": "600"}), None)
 _new11 = _store_pl11._blocks[-1]
 t("AT_pl11: downpayment creates payment #1", len(_new11.get("payments", [])) == 1)
 t("AT_pl11: payment #1 carries the amount", _new11["payments"][0]["amount"] == 500.0)
@@ -1638,9 +1664,12 @@ t("AT_ue2: unpriced block still offers the booking-type select",
   'name="btype"' in body_ue2)
 t("AT_ue2: unpriced block prompts for a booking type",
   "Choose a booking type" in body_ue2)
+t("AT_ue2: an unpriced block prefills no rental fee, forcing one to be entered",
+  'name="rental_fee" min="0.01" step="0.01" required value=""' in body_ue2)
 r_ue2 = _save(_store_ue2, "block#unp2",
               dates="2026-09-10 to 2026-09-13", h_tseglina="on",
-              label="Was Unpriced", btype="cash", g_tseglina="4")
+              label="Was Unpriced", btype="cash", g_tseglina="4",
+              rental_fee=calc_price("2026-09-10", "2026-09-13", {"tseglina": 4}))
 t("AT_ue2: save succeeds", "Reservation updated" in r_ue2["body"])
 _new_ue2 = _active(_store_ue2, "2026-09-10")
 t("AT_ue2: snapshot now exists", bool(_new_ue2.get("snapshot")))
@@ -1657,14 +1686,15 @@ _store_ue3 = FakeStore([{
     "created_by": "admin", "status": "active", "btype": "cash",
 }])
 _r_calc = _save(_store_ue3, "block#ue3", dates="2026-09-10 to 2026-09-13",
-                h_tseglina="on", label="Discount Guest", btype="cash", g_tseglina="4")
+                h_tseglina="on", label="Discount Guest", btype="cash", g_tseglina="4",
+                rental_fee=calc_price("2026-09-10", "2026-09-13", {"tseglina": 4}))
 _calc_sub = _active(_store_ue3, "2026-09-10")["snapshot"]["subtotal"]
 _sk3 = _active(_store_ue3, "2026-09-10")["sk"]
 r_ue3 = _save(_store_ue3, _sk3, dates="2026-09-10 to 2026-09-13", h_tseglina="on",
               label="Discount Guest", btype="cash", g_tseglina="4",
-              final_price=f"{_calc_sub - 200:.2f}", price_note="friend discount")
+              rental_fee=f"{_calc_sub - 200:.2f}", price_note="friend discount")
 _new_ue3 = _active(_store_ue3, "2026-09-10")
-t("AT_ue3: override created from the Final price field",
+t("AT_ue3: override created from the Rental fee field",
   _new_ue3["snapshot"].get("override_subtotal") == round(_calc_sub - 200, 2))
 t("AT_ue3: computed price preserved alongside",
   _new_ue3["snapshot"]["computed_subtotal"] == _calc_sub)
@@ -1676,20 +1706,21 @@ t("AT_ue3: details shows both prices", "line-through" in _det_ue3
   and f"${_calc_sub:,.2f}" in _det_ue3)
 t("AT_ue3: details shows the custom reason", "friend discount" in _det_ue3)
 
-# AT_ue4 – leaving Final price equal to calculated stores no override
+# AT_ue4 – leaving the rental fee equal to the calculated price stores no override
 _store_ue4 = FakeStore([{
     "pk": "blocks", "sk": "block#ue4", "houses": ["tseglina"],
     "checkin": "2026-09-10", "checkout": "2026-09-13", "label": "Full Price",
     "created_by": "admin", "status": "active", "btype": "cash",
 }])
 _save(_store_ue4, "block#ue4", dates="2026-09-10 to 2026-09-13", h_tseglina="on",
-      label="Full Price", btype="cash", g_tseglina="4")
+      label="Full Price", btype="cash", g_tseglina="4",
+      rental_fee=calc_price("2026-09-10", "2026-09-13", {"tseglina": 4}))
 _c4 = _active(_store_ue4, "2026-09-10")["snapshot"]["subtotal"]
 _sk4 = _active(_store_ue4, "2026-09-10")["sk"]
 _save(_store_ue4, _sk4, dates="2026-09-10 to 2026-09-13", h_tseglina="on",
-      label="Full Price", btype="cash", g_tseglina="4", final_price=f"{_c4:.2f}")
+      label="Full Price", btype="cash", g_tseglina="4", rental_fee=f"{_c4:.2f}")
 _n4 = _active(_store_ue4, "2026-09-10")
-t("AT_ue4: equal final price stores no override",
+t("AT_ue4: equal rental fee stores no override",
   "override_subtotal" not in _n4["snapshot"])
 t("AT_ue4: subtotal is still the calculated one", _n4["snapshot"]["subtotal"] == _c4)
 
@@ -1697,6 +1728,7 @@ t("AT_ue4: subtotal is still the calculated one", _n4["snapshot"]["subtotal"] ==
 _store_ue5 = FakeStore([_pl_block([_two[0]])])
 r_ue5 = _save(_store_ue5, "block#pl", dates="2026-09-10 to 2026-09-13",
               h_tseglina="on", label="Ledger Guest", btype="cash",
+              rental_fee=calc_price("2026-09-10", "2026-09-13", {"tseglina": 5}),
               pay_amount="2625", pay_date="2026-11-20", pay_note="balance")
 t("AT_ue5: save succeeds", "Reservation updated" in r_ue5["body"])
 _n5 = _active(_store_ue5, "2026-09-10")
@@ -1727,7 +1759,7 @@ _store_ue6 = FakeStore([
 _before6 = len(_store_ue6._blocks)
 r_ue6 = _save(_store_ue6, "block#pl", dates="2026-09-21 to 2026-09-24",
               h_tseglina="on", label="Ledger Guest", btype="cash",
-              final_price="999", price_note="should not stick",
+              rental_fee="999", price_note="should not stick",
               pay_amount="500", pay_date="2026-11-05")
 t("AT_ue6: conflict reported naming the blocker",
   "Conflict" in r_ue6["body"] and "Blocker" in r_ue6["body"])
@@ -1770,11 +1802,11 @@ _live9 = lambda_function._quote_for_prefill(
     lambda_function._edit_prefill(_store_ue9._blocks[0], PROPS_UE, {}), PROPS_UE)
 t("AT_ue9: calculated price differs from the stale stored subtotal",
   _live9 is not None and abs(_live9.subtotal - 3625.0) > 0.01)
-t("AT_ue9: final price prefills from the calculated value, not the stale one",
+t("AT_ue9: rental fee prefills from the calculated value, not the stale one",
   f'value="{_live9.subtotal:.2f}"' in body_ue9)
 r_ue9 = _save(_store_ue9, "block#pl", dates="2026-09-10 to 2026-09-13",
               h_tseglina="on", label="Ledger Guest", btype="cash",
-              final_price=f"{_live9.subtotal:.2f}")
+              rental_fee=f"{_live9.subtotal:.2f}")
 _n9 = _active(_store_ue9, "2026-09-10")
 t("AT_ue9: unchanged Save creates no override",
   "override_subtotal" not in _n9["snapshot"])
@@ -1913,7 +1945,7 @@ t("AT_tx7: details still shows the full outstanding", "Outstanding: $2,625.00" i
 _store_tx8 = FakeStore([_pl_block(_two, expenses=[
     {"id": "e1", "date": "2026-11-25", "amount": 200.0, "note": "linens"}])])
 r_tx8 = _save(_store_tx8, "block#pl", dates="2026-09-20 to 2026-09-24",
-              h_tseglina="on", label="Ledger Guest")
+              h_tseglina="on", label="Ledger Guest", rental_fee="3625")
 t("AT_tx8: edit succeeds", "Reservation updated" in r_tx8["body"])
 _n_tx8 = _active(_store_tx8, "2026-09-20")
 t("AT_tx8: expense carried onto the recreated record",
@@ -1942,7 +1974,8 @@ _store_tx9 = FakeStore([
      "created_by": "admin", "status": "active"},
 ])
 r_tx9 = _save(_store_tx9, "block#pl", dates="2026-09-21 to 2026-09-24",
-              h_tseglina="on", label="Ledger Guest", exp_amount="300")
+              h_tseglina="on", label="Ledger Guest", rental_fee="3625",
+              exp_amount="300")
 t("AT_tx9: conflict rejects the save", "Conflict" in r_tx9["body"])
 t("AT_tx9: no expense written on conflict",
   _expenses_len := len([x for x in _store_tx9._blocks
@@ -2067,7 +2100,7 @@ t("AT_sup4: superseded record frees its dates",
 r_sup4 = lambda_function.lambda_handler(ev("/admin", {
     "key": ADMIN_SECRET, "tab": "block", "action": "add_block",
     "dates": "2026-12-02 to 2026-12-04", "h_tseglina": "on",
-    "label": "New Booking"}), None)
+    "label": "New Booking", "rental_fee": "400"}), None)
 t("AT_sup4: no conflict against a superseded record",
   "Reservation added" in r_sup4["body"])
 _chart = lambda_function.lambda_handler(ev("/admin", {
@@ -2100,7 +2133,7 @@ t("AT_sup6: bonus due nets one expense only",
 # AT_sup7 – a live edit now supersedes rather than cancels, and money stays single
 _store_sup7 = FakeStore([_pl_block(_two)])
 r_sup7 = _save(_store_sup7, "block#pl", dates="2026-09-20 to 2026-09-24",
-               h_tseglina="on", label="Ledger Guest")
+               h_tseglina="on", label="Ledger Guest", rental_fee="3625")
 t("AT_sup7: edit succeeds", "Reservation updated" in r_sup7["body"])
 _old7 = [b for b in _store_sup7._blocks if b["sk"] == "block#pl"][0]
 t("AT_sup7: old record marked superseded", _old7["status"] == "superseded")
@@ -2124,7 +2157,7 @@ lambda_function._store = _store_rt1
 r_rt1 = lambda_function.lambda_handler(ev("/admin", {
     "key": ADMIN_SECRET, "tab": "block", "action": "add_block",
     "dates": "2026-07-10 to 2026-07-13", "h_tseglina": "on",
-    "label": "Retro Stay"}), None)
+    "label": "Retro Stay", "rental_fee": "600"}), None)
 t("AT_rt1: retro save succeeds", "Reservation added" in r_rt1["body"])
 t("AT_rt1: dates echoed in readable form",
   "Jul 10th → Jul 13th, 2026 (3 nights)" in r_rt1["body"])
@@ -2226,6 +2259,192 @@ _jul = lambda_function.lambda_handler(ev("/admin", {
     "key": ADMIN_SECRET, "tab": "block", "month": "2026-07"}), None)["body"]
 t("AT_rt7: Prev from Jul 2026 clamps at Jul 2026", "month=2026-07" in _jul)
 t("AT_rt7: Prev never offers June 2026", "month=2026-06" not in _jul)
+
+# ── AT_rf / AT_src: required rental fee + booking source ─────────────────────
+
+print("\n=== Required rental fee / Source tests ===")
+
+# The admin forms submit over GET, so a "create" or "edit" request here is the
+# same handler call the form itself makes — only the query string differs.
+
+def _add(store, **fields):
+    lambda_function._store = store
+    q = {"key": ADMIN_SECRET, "tab": "block", "action": "add_block"}
+    q.update({k: str(v) for k, v in fields.items()})
+    return lambda_function.lambda_handler(ev("/admin", q), None)
+
+
+def _details(store, sk):
+    lambda_function._store = store
+    return lambda_function.lambda_handler(ev("/admin", {
+        "key": ADMIN_SECRET, "tab": "block", "details": sk}), None)["body"]
+
+
+def _panel(body):
+    """Just the details panel — the add form below it has its own fee field."""
+    return body.split(">Done</a>")[0]
+
+
+_RF_BASE = dict(dates="2026-09-10 to 2026-09-13", h_tseglina="on", label="Fee Guest")
+
+# AT_rf1 – a create with no usable rental fee is refused outright
+for _bad, _why in [(None, "omitted"), ("", "empty"), ("0", "zero"),
+                   ("-5", "negative"), ("abc", "non-numeric")]:
+    _s_rf1 = FakeStore()
+    _fields = dict(_RF_BASE)
+    if _bad is not None:
+        _fields["rental_fee"] = _bad
+    _r_rf1 = _add(_s_rf1, **_fields)
+    t(f"AT_rf1: create with rental fee {_why} → 400", _r_rf1["statusCode"] == 400)
+    t(f"AT_rf1: nothing written when the fee is {_why}", _s_rf1._blocks == [])
+t("AT_rf1: the refusal names the field", "Rental fee" in _r_rf1["body"])
+
+# AT_rf2 – a valid fee is accepted and becomes the reservation's price
+_s_rf2 = FakeStore()
+_r_rf2 = _add(_s_rf2, **dict(_RF_BASE, rental_fee="570"))
+t("AT_rf2: create with a fee of 570 → 200", _r_rf2["statusCode"] == 200)
+t("AT_rf2: reservation saved", "Reservation added" in _r_rf2["body"])
+_b_rf2 = _s_rf2._blocks[-1]
+t("AT_rf2: the fee is stored as the price", _b_rf2["snapshot"]["subtotal"] == 570.0)
+t("AT_rf2: it is not recorded as a custom override",
+  "override_subtotal" not in _b_rf2 and "override_subtotal" not in _b_rf2["snapshot"])
+t("AT_rf2: outstanding is measured against it",
+  lambda_function._payment_state(_b_rf2)[1] == 570.0)
+t("AT_rf2: bonus derives from the fee", _b_rf2["snapshot"]["bonus"] == 114.0)
+_det_rf2 = _details(_s_rf2, _b_rf2["sk"])
+t("AT_rf2: details shows the price", "$570.00" in _det_rf2)
+t("AT_rf2: details no longer says unpriced",
+  "No pricing recorded" not in _panel(_det_rf2))
+t("AT_rf2: a fractional fee is kept to the cent",
+  _add(FakeStore(), **dict(_RF_BASE, rental_fee="0.01"))["statusCode"] == 200)
+
+# AT_rf3 – both forms block it client-side too, and the field is reachable
+_form_rf3 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block"}), None)["body"]
+_REQ = 'name="rental_fee" min="0.01" step="0.01" required'
+t("AT_rf3: add form labels the field 'Rental fee ($)'",
+  "Rental fee ($)" in _form_rf3)
+t("AT_rf3: add form marks it required and positive", _REQ in _form_rf3)
+t("AT_rf3: the required field is not hidden inside the collapsed calculator",
+  _form_rf3.index('name="rental_fee"') > _form_rf3.rindex("</details>"))
+_edit_rf3 = _edit(FakeStore([_pl_block(_two)]), "block#pl")
+t("AT_rf3: edit form labels the field 'Rental fee ($)'", "Rental fee ($)" in _edit_rf3)
+t("AT_rf3: edit form marks it required and positive", _REQ in _edit_rf3)
+
+# AT_rf4 – an edit that omits the fee cannot silently drop a price
+_s_rf4 = FakeStore([_pl_block(_two)])
+_r_rf4 = _save(_s_rf4, "block#pl", dates="2026-09-11 to 2026-09-14",
+               h_tseglina="on", label="Ledger Guest")
+t("AT_rf4: edit without a rental fee → 400", _r_rf4["statusCode"] == 400)
+t("AT_rf4: no replacement record written", len(_s_rf4._blocks) == 1)
+t("AT_rf4: the original is still active", _s_rf4._blocks[0]["status"] == "active")
+t("AT_rf4: its price is untouched", _s_rf4._blocks[0]["snapshot"]["subtotal"] == 3625.0)
+t("AT_rf4: the same edit with a fee goes through",
+  _save(_s_rf4, "block#pl", dates="2026-09-11 to 2026-09-14", h_tseglina="on",
+        label="Ledger Guest", rental_fee="3625")["statusCode"] == 200)
+
+# AT_rf5 – legacy unpriced records stay readable, but an edit must price them
+_legacy_rf = {"pk": "blocks", "sk": "block#legacy", "houses": ["tseglina"],
+              "checkin": "2026-09-10", "checkout": "2026-09-13",
+              "label": "Legacy Guest", "created_by": "admin", "status": "active"}
+_s_rf5 = FakeStore([dict(_legacy_rf)])
+t("AT_rf5: an unpriced legacy record still reads as unpriced",
+  "No pricing recorded" in _panel(_details(_s_rf5, "block#legacy")))
+t("AT_rf5: its edit screen prefills no fee, forcing one to be entered",
+  _REQ + ' value=""' in _edit(_s_rf5, "block#legacy"))
+t("AT_rf5: saving it without a fee is refused",
+  _save(_s_rf5, "block#legacy", dates="2026-09-10 to 2026-09-13",
+        h_tseglina="on", label="Legacy Guest")["statusCode"] == 400)
+t("AT_rf5: it is left unpriced and active",
+  _s_rf5._blocks[0]["status"] == "active" and "snapshot" not in _s_rf5._blocks[0])
+_save(_s_rf5, "block#legacy", dates="2026-09-10 to 2026-09-13",
+      h_tseglina="on", label="Legacy Guest", rental_fee="800")
+t("AT_rf5: entering a fee prices it", _active(_s_rf5, "2026-09-10")["snapshot"]["subtotal"] == 800.0)
+t("AT_rf5: and the legacy record is superseded, not left behind",
+  _s_rf5._blocks[0]["status"] == "superseded")
+
+# AT_rf6 – `final_price` is the old name for the same field and still works
+_s_rf6 = FakeStore()
+_r_rf6 = _add(_s_rf6, **dict(_RF_BASE, final_price="640"))
+t("AT_rf6: a legacy final_price URL still saves", _r_rf6["statusCode"] == 200)
+t("AT_rf6: it sets the same price", _s_rf6._blocks[-1]["snapshot"]["subtotal"] == 640.0)
+
+# AT_rf7 – the price-override action cannot be used to get around the rule
+_s_rf7 = FakeStore([_pl_block(_two)])
+lambda_function._store = _s_rf7
+_r_rf7 = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "block", "action": "set_price",
+    "block_id": "block#pl", "price": "0"}), None)
+t("AT_rf7: setting a price of zero → 400", _r_rf7["statusCode"] == 400)
+t("AT_rf7: the price is untouched",
+  _s_rf7._blocks[0]["snapshot"]["subtotal"] == 3625.0)
+
+# AT_src1 – the dropdown offers exactly the eight channels, blank by default
+_sel_re = _re.compile(r'<select name="source">.*?</select>', _re.S)
+_sel_add = _sel_re.search(_form_rf3)
+_sel_edit = _sel_re.search(_edit_rf3)
+t("AT_src1: add form has a Source dropdown", _sel_add is not None)
+t("AT_src1: edit form has a Source dropdown", _sel_edit is not None)
+t("AT_src1: exactly the eight channels plus a blank",
+  _sel_add.group(0).count("<option") == 9)
+t("AT_src1: every channel is offered, in order",
+  [m for m in _re.findall(r'<option value="([^"]*)"', _sel_add.group(0))]
+  == [""] + list(lambda_function._SOURCES))
+t("AT_src1: blank renders as an em dash", ">—</option>" in _sel_add.group(0))
+t("AT_src1: blank is the default selection",
+  '<option value="" selected>—</option>' in _sel_add.group(0))
+t("AT_src1: the label reads Source", "Source " in _form_rf3)
+
+# AT_src2 – a source is stored, shown, and carried across an edit
+_s_src2 = FakeStore()
+_r_src2 = _add(_s_src2, **dict(_RF_BASE, rental_fee="570", source="Instagram Ad"))
+t("AT_src2: create with a source → 200", _r_src2["statusCode"] == 200)
+_b_src2 = _s_src2._blocks[-1]
+t("AT_src2: source stored on the record", _b_src2.get("source") == "Instagram Ad")
+t("AT_src2: details shows it", "Source: Instagram Ad" in _panel(_details(_s_src2, _b_src2["sk"])))
+t("AT_src2: the edit form preselects it",
+  '<option value="Instagram Ad" selected>' in _edit(_s_src2, _b_src2["sk"]))
+_r_src2b = _save(_s_src2, _b_src2["sk"], dates="2026-09-12 to 2026-09-15",
+                 h_tseglina="on", label="Fee Guest", rental_fee="570")
+t("AT_src2: the dates-only edit succeeds", "Reservation updated" in _r_src2b["body"])
+_new_src2 = _active(_s_src2, "2026-09-12")
+t("AT_src2: source carried onto the new record",
+  _new_src2.get("source") == "Instagram Ad")
+t("AT_src2: the old record is marked superseded",
+  [b for b in _s_src2._blocks if b["sk"] == _b_src2["sk"]][0]["status"] == "superseded")
+t("AT_src2: an edit that resubmits the dropdown can change it",
+  _save(_s_src2, _new_src2["sk"], dates="2026-09-12 to 2026-09-15", h_tseglina="on",
+        label="Fee Guest", rental_fee="570", source="Threads")["statusCode"] == 200
+  and _active(_s_src2, "2026-09-12").get("source") == "Threads")
+t("AT_src2: and a blank one clears it",
+  _save(_s_src2, _active(_s_src2, "2026-09-12")["sk"],
+        dates="2026-09-12 to 2026-09-15", h_tseglina="on", label="Fee Guest",
+        rental_fee="570", source="")["statusCode"] == 200
+  and "source" not in _active(_s_src2, "2026-09-12"))
+
+# AT_src3 – no source is a valid reservation, and the details line disappears
+_s_src3 = FakeStore()
+_r_src3 = _add(_s_src3, **dict(_RF_BASE, rental_fee="570"))
+t("AT_src3: create with no source → 200", _r_src3["statusCode"] == 200)
+_b_src3 = _s_src3._blocks[-1]
+t("AT_src3: no source key on the record", "source" not in _b_src3)
+t("AT_src3: details omits the Source line",
+  "Source:" not in _panel(_details(_s_src3, _b_src3["sk"])))
+
+# AT_src4 – anything outside the list is refused
+_s_src4 = FakeStore()
+_r_src4 = _add(_s_src4, **dict(_RF_BASE, rental_fee="570", source="TikTok"))
+t("AT_src4: unknown source → 400", _r_src4["statusCode"] == 400)
+t("AT_src4: the refusal names the value", "TikTok" in _r_src4["body"])
+t("AT_src4: nothing written", _s_src4._blocks == [])
+_s_src4b = FakeStore([_pl_block(_two, source="Instagram")])
+t("AT_src4: an unknown source on an edit is refused too",
+  _save(_s_src4b, "block#pl", dates="2026-09-10 to 2026-09-13", h_tseglina="on",
+        label="Ledger Guest", rental_fee="3625",
+        source="instagram ad")["statusCode"] == 400)
+t("AT_src4: the stored source survives the refusal",
+  _s_src4b._blocks[0].get("source") == "Instagram"
+  and _s_src4b._blocks[0]["status"] == "active")
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 print()

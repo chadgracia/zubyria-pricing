@@ -40,6 +40,64 @@ def _date_floor_error(d, admin):
 
 _TAB_ALIASES = {"reservations": "block", "pricing": "price", "finances": "bonus"}
 
+# Where the booking came from. Optional on the forms, but a submitted value must be
+# one of these — a free-text channel would make any by-channel report meaningless.
+_SOURCES = ("Former Guest", "Instagram", "Instagram Ad", "Airbnb", "Booking",
+            "Event Guest", "Word-of-Mouth", "Threads")
+
+_PRICED_BTYPES = ("cash", "airbnb", "monobank", "stripe")
+
+
+class _Rejected(ValueError):
+    """Input the server refuses outright — answered with 400, not a soft message.
+
+    Used for the rules that must never be bypassed by a hand-made URL (a missing
+    or non-positive rental fee, an unknown source). Other input problems stay
+    200-with-a-message, which is what the form flow expects.
+    """
+
+
+def _rental_fee_from(qs):
+    """The submitted rental fee as a positive float, or raise _Rejected.
+
+    `final_price` is the old name for the same field on the Edit screen; it is
+    still honoured so an in-flight URL does not lose its price.
+    """
+    raw = qs.get("rental_fee") if "rental_fee" in qs else qs.get("final_price")
+    if raw is None or not str(raw).strip():
+        raise _Rejected("Rental fee is required.")
+    try:
+        fee = float(str(raw).strip())
+    except ValueError:
+        raise _Rejected("Rental fee must be a number.")
+    if fee <= 0:
+        raise _Rejected("Rental fee must be greater than zero.")
+    return round(fee, 2)
+
+
+def _source_from(qs, original=None):
+    """The submitted source, validated; carried off the edited record when absent.
+
+    An edit that never renders the dropdown (or any programmatic re-save) must not
+    silently drop the channel, so absence means "keep", exactly like payments,
+    expenses and notes. A present-but-blank value is a deliberate clear.
+    """
+    if "source" in qs:
+        src = (qs.get("source") or "").strip()
+        if src and src not in _SOURCES:
+            raise _Rejected(f'Unknown source "{src}".')
+        return src
+    return ((original or {}).get("source") or "").strip()
+
+
+def _source_select(selected, name="source"):
+    """The Source dropdown, shared by the add and edit forms. Blank is the default."""
+    opts = ""
+    for s in ("",) + _SOURCES:
+        sel = " selected" if (selected or "") == s else ""
+        opts += f'<option value="{html_esc(s)}"{sel}>{html_esc(s) if s else "—"}</option>'
+    return f'<select name="{name}">{opts}</select>'
+
 _BLOCK_COLORS = ["#4e7a5b", "#4a6080", "#7a5a4a", "#6a4f80", "#3d7070"]
 
 # Tape-chart day column width in px. Must match .tape-dc in CSS — bar geometry is
@@ -130,6 +188,7 @@ def _edit_prefill(b, props, qs):
         "notes": b.get("notes", ""),
         "btype": b.get("btype", ""),
         "price_note": b.get("price_note", ""),
+        "source": b.get("source", ""),
     }
     for h in b.get("houses", []):
         pf[f"h_{h}"] = "on"
@@ -142,20 +201,26 @@ def _edit_prefill(b, props, qs):
             pf[k] = str(qp[k])
     if qp.get("event"):
         pf["event"] = "on"
-    # Prefill the final price ONLY from an existing override. Falling back to the
-    # stored subtotal would be wrong: if the calculated price has since drifted
-    # (rules changed, stale snapshot), pressing Save unchanged would silently mint
-    # an override pinning the old number. With no override the field defaults to the
-    # freshly calculated price, so an unchanged Save is genuinely a no-op.
+    # Prefill the rental fee only from a price that cannot drift: an explicit
+    # override, or the stored subtotal of a reservation priced without the
+    # calculator (no booking type, so nothing recalculates under it). Where a live
+    # calculation exists the field falls back to that instead — prefilling a stale
+    # stored subtotal would let an unchanged Save silently mint an override pinning
+    # the old number. A legacy unpriced record prefills empty, so the required field
+    # forces a fee to be entered before it can be saved.
     if b.get("override_subtotal"):
-        pf["final_price"] = f"{float(b['override_subtotal']):.2f}"
+        pf["rental_fee"] = f"{float(b['override_subtotal']):.2f}"
+    elif b.get("btype") not in _PRICED_BTYPES:
+        stored = float((b.get("snapshot") or {}).get("subtotal") or 0)
+        if stored:
+            pf["rental_fee"] = f"{stored:.2f}"
     return pf
 
 
 def _quote_for_prefill(pf, props):
     """Live quote for the values currently in the Edit form, or None."""
     btype = (pf.get("btype") or "").strip()
-    if btype not in ("cash", "airbnb", "monobank", "stripe"):
+    if btype not in _PRICED_BTYPES:
         return None
     try:
         parts = [s.strip() for s in
@@ -223,7 +288,8 @@ def _render_edit_screen(props, b, pf, admin_key, kp, msg, price_warning, confirm
         f'value="{v("event_guests", "0")}" style="width:60px"></label></div>'
         f'<div class="row" style="margin-top:10px">'
         f'<label>Guest / reason <input type="text" name="label" value="{v("label")}" '
-        f'required style="min-width:260px"></label></div>'
+        f'required style="min-width:260px"></label>'
+        f'<label>Source {_source_select(pf.get("source", ""))}</label></div>'
         f'<label style="display:block;margin-top:10px">'
         f'<span style="display:block;color:var(--dim);font:12px Verdana;'
         f'margin-bottom:4px">Notes</span>'
@@ -236,7 +302,7 @@ def _render_edit_screen(props, b, pf, admin_key, kp, msg, price_warning, confirm
 
     # --- 2. PRICE ----------------------------------------------------------
     btype_opts = ""
-    for bt_id, bt_lbl in [("", "No pricing"), ("cash", "Cash"),
+    for bt_id, bt_lbl in [("", "No booking type"), ("cash", "Cash"),
                           ("airbnb", "Airbnb (15.5%)"),
                           ("monobank", "Site — UA card (1.3%)"),
                           ("stripe", "Site — Int'l card (5.5%)")]:
@@ -247,11 +313,11 @@ def _render_edit_screen(props, b, pf, admin_key, kp, msg, price_warning, confirm
         calc_line = (f'Calculated price: <b>${live.subtotal:,.2f}</b>'
                      f'<span style="color:var(--dim);font-size:12px"> for the inputs '
                      f'above</span>')
-        final_default = pf.get("final_price") or f"{live.subtotal:.2f}"
+        fee_default = pf.get("rental_fee") or f"{live.subtotal:.2f}"
     else:
         calc_line = ('<span style="color:var(--dim)">Choose a booking type above to '
-                     'calculate a price for this stay.</span>')
-        final_default = pf.get("final_price", "")
+                     'calculate a price, or just enter the rental fee below.</span>')
+        fee_default = pf.get("rental_fee", "")
     is_custom = b.get("override_subtotal") is not None
     revert = ""
     if is_custom:
@@ -264,15 +330,16 @@ def _render_edit_screen(props, b, pf, admin_key, kp, msg, price_warning, confirm
         f'<select name="btype">{btype_opts}</select></label></div>'
         f'<p style="margin:10px 0 6px;font:13px Verdana,sans-serif">{calc_line}</p>'
         f'<div class="row" style="align-items:flex-end">'
-        f'<label>Final price ($) <input type="number" name="final_price" min="0" '
-        f'step="0.01" value="{html_esc(str(final_default))}" style="width:110px">'
-        f'</label>'
+        f'<label>Rental fee ($) <input type="number" name="rental_fee" min="0.01" '
+        f'step="0.01" required value="{html_esc(str(fee_default))}" '
+        f'style="width:110px"></label>'
         f'<label>Reason <input type="text" name="price_note" '
         f'value="{v("price_note")}" placeholder="e.g. friend discount" '
         f'style="min-width:200px"></label>{revert}</div>'
         f'<p style="color:var(--dim);font-size:11px;font-family:Verdana;'
-        f'margin:8px 0 0">Leave the final price equal to the calculated price for no '
-        f'override. Cleaning is a fixed cost and is never discounted.</p>'
+        f'margin:8px 0 0">Every reservation needs a rental fee. Leave it equal to the '
+        f'calculated price for no override. Cleaning is a fixed cost and is never '
+        f'discounted.</p>'
         f'</fieldset>'
     )
 
@@ -1569,9 +1636,11 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
             else:
                 pay_html = ""
             if snap:
-                btype_key = b.get("btype", "cash")
+                # A reservation priced by its rental fee alone has no booking type;
+                # naming one would claim a payment method nobody chose.
+                btype_key = b.get("btype") or ""
                 bt_info = _BT.get(btype_key, {})
-                bt_label = bt_info.get("label", btype_key)
+                bt_label = bt_info.get("label") or "No booking type"
                 subtotal = snap.get("subtotal", 0)
                 gross_profit = snap.get("gross_profit", 0)
                 bonus = snap.get("bonus", 0)
@@ -1684,6 +1753,10 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
                     f'style="color:var(--err);border-color:var(--err)">Cancel</a>'
                 )
 
+            # Source is optional, so the line disappears rather than reading "—".
+            src_val = (b.get("source") or "").strip()
+            source_line = f'Source: {html_esc(src_val)}<br>' if src_val else ""
+
             done_url = f"/admin?tab=block{kp}"
             confirm_html = (
                 f'<div class="result" style="margin-bottom:20px">'
@@ -1691,6 +1764,7 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
                 f'<p style="margin-bottom:4px"><b>{html_esc(b.get("label","?"))}</b><br>'
                 f'Houses: {html_esc(houses_str)}<br>'
                 f'{html_esc(_fmt_range(b.get("checkin",""), b.get("checkout","")))}<br>'
+                f'{source_line}'
                 f'{_provenance(b)}</p>'
                 f'{finance_html}'
                 f'{_payments_section(b, kp, confirm_rm)}'
@@ -1750,14 +1824,30 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
         has_btype = bool(pf.get("btype"))
         popen = " open" if has_btype else ""
         btype_opts = ""
-        for bt_id, bt_lbl in [("", "No pricing"), ("cash", "Cash"), ("airbnb", "Airbnb (15.5%)"),
+        for bt_id, bt_lbl in [("", "No booking type"), ("cash", "Cash"), ("airbnb", "Airbnb (15.5%)"),
                                 ("monobank", "Site — UA card (1.3%)"), ("stripe", "Site — Int'l card (5.5%)")]:
             sel_a = " selected" if pf.get("btype", "") == bt_id else ""
             btype_opts += f'<option value="{bt_id}"{sel_a}>{bt_lbl}</option>'
         ev_chk = " checked" if pf.get("event") in ("on", "1", "true") else ""
+        # The rental fee is required, so it lives outside the disclosure below: a
+        # required control inside a closed <details> cannot be focused, and the
+        # browser refuses the submit without ever showing the user why.
+        fee_and_source = (
+            f'<fieldset><legend>Rental fee</legend><div class="row">'
+            f'<label>Rental fee ($) <input type="number" name="rental_fee" '
+            f'min="0.01" step="0.01" required '
+            f'value="{html_esc(pf.get("rental_fee", ""))}" placeholder="0.00" '
+            f'style="width:110px"></label>'
+            f'<label>Source {_source_select(pf.get("source", ""))}</label>'
+            f'</div>'
+            f'<p style="color:var(--dim);font-size:11px;font-family:Verdana;'
+            f'margin:8px 0 0">What the guest is charged for the stay. Source is '
+            f'optional.</p></fieldset>'
+        )
+
         pricing_expander = (
             f'<details{popen} style="margin-top:12px">'
-            f'<summary style="cursor:pointer;color:var(--dim);font:12px Verdana">Pricing (optional — for bonus tracking)</summary>'
+            f'<summary style="cursor:pointer;color:var(--dim);font:12px Verdana">Rate calculator (optional — for bonus tracking)</summary>'
             f'<div style="margin-top:10px">'
             f'<div class="row" style="margin-bottom:10px">'
             f'<label>Booking type <select name="btype">{btype_opts}</select></label>'
@@ -1829,6 +1919,7 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
             f'placeholder="Guest name or reason" required style="min-width:260px">'
             f'{notes_field}'
             f'{pricing_expander}</fieldset>'
+            f'{fee_and_source}'
             f'<button type="submit">{block_btn}</button>'
             f'<a href="{html_esc(back_href)}" class="btn-sec" style="margin-left:10px">← Calculator</a>'
             f'</form>'
@@ -1914,6 +2005,7 @@ def _lambda_handler(event, context):
         msg = ""
         price_warning = ""
         prefill = dict(qs)
+        status = 200
 
         # Block actions (only relevant in block tab)
         if action == "add_block":
@@ -1942,11 +2034,27 @@ def _lambda_handler(event, context):
                 _floor_err = _date_floor_error(ci, admin=True)
                 if _floor_err:
                     raise ValueError(_floor_err)
+
+                # The record being replaced, read once: an edit recreates the item,
+                # so everything that lives on the reservation rather than in the
+                # form (ledgers, source, price reason) is carried across from here.
+                orig = None
+                if edit_id:
+                    for _ob in _get_store().list_blocks():
+                        if _ob.get("sk") == edit_id:
+                            orig = _ob
+                            break
+
+                # Both refuse the save outright (400) rather than writing a
+                # reservation with no price or an unrecognised channel.
+                rental_fee = _rental_fee_from(qs)
+                source = _source_from(qs, orig)
+
                 # Snapshot computation if btype provided
                 snapshot = None
                 quote_params_out = None
                 snap_btype = qs.get("btype", "").strip()
-                if snap_btype and snap_btype in ("cash", "airbnb", "monobank", "stripe"):
+                if snap_btype and snap_btype in _PRICED_BTYPES:
                     try:
                         snap_bookings = {h: int(qs.get(f"g_{h}", props[h]["base_cap"])) for h in houses}
                         snap_jac = int(qs.get("jacuzzi", 0) or 0)
@@ -1978,60 +2086,60 @@ def _lambda_handler(event, context):
                     except Exception:
                         pass
 
-                # An existing manual price survives a date/param edit: the amount is
-                # kept verbatim and its fees/bonus are re-derived against the new
-                # snapshot. Whether it still applies is a human call, hence the warning.
-                # Read off the block being edited, not the URL: the override and its
-                # note belong to the booking, not to whatever the form posted.
-                ov_in, price_note = 0.0, ""
-                if "final_price" in qs:
-                    # Unified Edit screen: the form is authoritative. A final price
-                    # equal to the calculated one means "no override" — that is how
-                    # an override is cleared without a separate revert.
-                    price_note = qs.get("price_note", "").strip()
-                    try:
-                        _fin = float(qs.get("final_price") or 0)
-                    except ValueError:
-                        _fin = 0.0
-                    _calc = float((snapshot or {}).get("subtotal") or 0)
-                    if _fin and snapshot and abs(_fin - _calc) > 0.005:
-                        ov_in = _fin
-                elif edit_id:
-                    for _ob in _get_store().list_blocks():
-                        if _ob.get("sk") == edit_id:
-                            ov_in = float(_ob.get("override_subtotal") or 0)
-                            price_note = (_ob.get("price_note") or "").strip()
-                            break
+                # The submitted rental fee is the price. Where the calculator also
+                # produced one, a fee that differs from it is a manual override —
+                # that is also how an override is cleared without a separate revert,
+                # by submitting the calculated figure. The reason comes from the form
+                # when the form carries the field, else off the record being edited,
+                # so a programmatic re-save cannot orphan an override's explanation.
+                price_note = (qs.get("price_note", "").strip() if "price_note" in qs
+                              else ((orig or {}).get("price_note") or "").strip())
+                ov_in = 0.0
+                _calc = float((snapshot or {}).get("subtotal") or 0)
+                if snapshot and abs(rental_fee - _calc) > 0.005:
+                    ov_in = rental_fee
                 if ov_in and snapshot:
                     cleaning = float(snapshot.get("cleaning_total", 0) or 0)
                     if ov_in >= cleaning:
                         snapshot = _apply_override(snapshot, snap_btype, ov_in)
-                        price_warning = (
-                            f"Custom price ${ov_in:,.2f} kept from before this change — "
-                            f"re-check that it still applies to the new dates/params."
-                        )
+                        if edit_id:
+                            price_warning = (
+                                f"Custom price ${ov_in:,.2f} kept from before this "
+                                f"change — re-check that it still applies to the new "
+                                f"dates/params."
+                            )
+                        else:
+                            price_warning = (
+                                f"Rental fee ${ov_in:,.2f} recorded as a custom price "
+                                f"— the calculated price for this stay is "
+                                f"${_calc:,.2f}."
+                            )
                     else:
                         ov_in = 0.0
                         price_warning = (
-                            "Custom price dropped: it was below the cleaning cost "
-                            "for the new dates."
+                            f"Rental fee ${rental_fee:,.2f} is below the cleaning cost "
+                            f"(${cleaning:,.2f}), so the calculated price was kept."
                         )
+
+                # With no calculator inputs the rental fee alone is the price, so the
+                # record still gets a snapshot and reads like every other priced
+                # reservation. Nothing recalculates under it, hence no override and
+                # no cleaning split — the fee is the whole of it.
+                if snapshot is None:
+                    _derived = _recompute_from_subtotal(rental_fee, 0.0, "cash")
+                    snapshot = {
+                        "subtotal": rental_fee,
+                        "cleaning_total": 0.0,
+                        "rental_price": rental_fee,
+                        "gross_profit": _derived["gross_profit"],
+                        "bonus": _derived["bonus"],
+                    }
 
                 # Ledger carried server-side off the block being edited — payments are
                 # too large and too sensitive to thread through a query string, and
                 # the edit path recreates the item, which would otherwise orphan them.
-                carry_payments = []
-                if edit_id:
-                    for _ob in _get_store().list_blocks():
-                        if _ob.get("sk") == edit_id:
-                            carry_payments = [dict(p) for p in _payments_of(_ob)]
-                            break
-                carry_expenses = []
-                if edit_id:
-                    for _ob in _get_store().list_blocks():
-                        if _ob.get("sk") == edit_id:
-                            carry_expenses = [dict(e) for e in _expenses_of(_ob)]
-                            break
+                carry_payments = [dict(p) for p in _payments_of(orig)] if orig else []
+                carry_expenses = [dict(e) for e in _expenses_of(orig)] if orig else []
                 try:
                     exp_amt = float(qs.get("exp_amount", "") or 0)
                 except ValueError:
@@ -2079,6 +2187,7 @@ def _lambda_handler(event, context):
                     price_note=price_note or None,
                     payments=carry_payments or None,
                     expenses=carry_expenses or None,
+                    source=source or None,
                 )
                 if r["ok"]:
                     if edit_id:
@@ -2092,6 +2201,11 @@ def _lambda_handler(event, context):
                 else:
                     conflicts = ", ".join(r["conflicts"])
                     msg = f"Conflict: those dates are already taken by: {conflicts}"
+            except _Rejected as e:
+                # A rule the form itself enforces: reaching here means the request
+                # bypassed it, so answer 400 rather than a soft in-page message.
+                msg = f"Error: {e}"
+                status = 400
             except ValueError as e:
                 msg = f"Error: {e}"
             tab = "block"
@@ -2210,8 +2324,11 @@ def _lambda_handler(event, context):
                     new_price = float(qs.get("price", "") or 0)
                 except ValueError:
                     new_price = -1.0
-                if new_price < 0:
-                    msg = "Error: enter a valid price."
+                # Same floor as the rental fee on the forms: this action is the only
+                # other way to write a price, so it must not be a way around the rule.
+                if new_price <= 0:
+                    msg = "Error: enter a price greater than zero."
+                    status = 400
                 elif new_price < cleaning:
                     msg = (f"Error: price must be at least the cleaning cost "
                            f"(${cleaning:,.2f}).")
@@ -2283,6 +2400,9 @@ def _lambda_handler(event, context):
                     f"/admin?tab=block&dates={urllib.parse.quote(date_str, safe='')}"
                     f"&{houses_qs}&{guests_qs}"
                     f"&btype={btype}&jacuzzi={jacuzzi}&pets={pets}"
+                    # The rental fee is required on the add form, so hand it the price
+                    # just quoted — it stays editable before the reservation is saved.
+                    f"&rental_fee={q_price.subtotal:.2f}"
                     f"{event_part}{kp_link}"
                 )
 
@@ -2311,7 +2431,7 @@ def _lambda_handler(event, context):
                     break
 
         admin_key = ADMIN_SECRET if via_key else ""
-        resp = _resp(200, render_admin(
+        resp = _resp(status, render_admin(
             props, blocks, msg=msg, prefill=prefill, admin_key=admin_key,
             tab=tab, q=q_price, price_error=price_error, price_params=dict(qs),
             avail=price_avail, block_url=price_block_url,
@@ -2396,7 +2516,8 @@ def _lambda_handler(event, context):
         houses_qs = "&".join(f"h_{h}=on" for h in bookings)
         date_str = qs.get("dates", f"{checkin.isoformat()} to {checkout.isoformat()}")
         kp = f"&key={ADMIN_SECRET}" if via_key else ""
-        block_url = f"/admin?tab=block&dates={date_str}&{houses_qs}{kp}"
+        block_url = (f"/admin?tab=block&dates={date_str}&{houses_qs}"
+                     f"&rental_fee={q.subtotal:.2f}{kp}")
 
     return _resp(200, render_page(props, qs, q=q, avail=avail, block_url=block_url))
 
