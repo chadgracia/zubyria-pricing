@@ -2227,6 +2227,34 @@ _jul = lambda_function.lambda_handler(ev("/admin", {
 t("AT_rt7: Prev from Jul 2026 clamps at Jul 2026", "month=2026-07" in _jul)
 t("AT_rt7: Prev never offers June 2026", "month=2026-06" not in _jul)
 
+# AT_lp1 – LAUNCH PARTY tab: nav, content, order, and key-gating
+print()
+print("=== LAUNCH PARTY tab ===")
+
+lambda_function._store = FakeStore()
+_lp_admin = lambda_function.lambda_handler(ev("/admin", {"key": ADMIN_SECRET}), None)["body"]
+t("AT_lp1: tab toggle contains LAUNCH PARTY", "LAUNCH PARTY" in _lp_admin)
+
+_lp = lambda_function.lambda_handler(ev("/admin", {
+    "key": ADMIN_SECRET, "tab": "party"}), None)["body"]
+t("AT_lp1: party tab has heading", "Zubyria Launch Party" in _lp)
+t("AT_lp1: party tab has Бабусі", "Бабусі" in _lp)
+t("AT_lp1: party tab has Vlada playing", "Vlada playing" in _lp)
+t("AT_lp1: party tab has Bonfire", "Bonfire" in _lp)
+
+_i1600 = _lp.index("16:00")
+_i1730 = _lp.index("17:30")
+_i1800 = _lp.index("18:00")
+_i1915 = _lp.index("19:15")
+_i2045 = _lp.index("20:45")
+t("AT_lp1: times appear in schedule order",
+  _i1600 < _i1730 < _i1800 < _i1915 < _i2045)
+
+_lp_no_key = lambda_function.lambda_handler(ev("/admin"), None)["body"]
+t("AT_lp1: no key does not leak party content", "Zubyria Launch Party" not in _lp_no_key)
+_lp_bad_key = lambda_function.lambda_handler(ev("/admin", {"key": "wrong"}), None)["body"]
+t("AT_lp1: wrong key does not leak party content", "Zubyria Launch Party" not in _lp_bad_key)
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 print()
 print(f"Results: {_passed} passed, {_failed} failed out of {_passed + _failed}")

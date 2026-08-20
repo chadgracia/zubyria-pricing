@@ -1222,6 +1222,37 @@ def render_page(props: dict, params=None, q: Quote = None, error=None,
     )
 
 
+_LAUNCH_PARTY_SCHEDULE = (
+    ("16:00", "Guests arrive"),
+    ("16:15 – 17:00", "Welcome drinks + Zubyria tour (ending in Modryna)"),
+    ("17:30", "Бабусі"),
+    ("18:00 – 19:00", "Horses to the river"),
+    ("19:15", "Dinner in Modryna (Vlada playing)"),
+    ("20:45", "Bonfire"),
+    ("", "The end"),
+)
+
+
+def _render_launch_party():
+    rows = "".join(
+        f'<tr><td style="padding:6px 14px 6px 0;color:var(--accent);'
+        f'font:13px Verdana,sans-serif;white-space:nowrap;vertical-align:top">'
+        f'{html_esc(t)}</td>'
+        f'<td style="padding:6px 0;font:15px Georgia,\'Times New Roman\',serif">'
+        f'{html_esc(item)}</td></tr>'
+        for t, item in _LAUNCH_PARTY_SCHEDULE
+    )
+    return (
+        f'<h2 style="font:16px Verdana,sans-serif;margin:0 0 4px">'
+        f'Zubyria Launch Party</h2>'
+        f'<p style="color:var(--dim);font:13px Verdana,sans-serif;margin:0 0 20px">'
+        f'First week of October · 20 guests</p>'
+        f'<div class="result"><div style="overflow-x:auto">'
+        f'<table style="border-collapse:collapse;width:100%">{rows}</table>'
+        f'</div></div>'
+    )
+
+
 def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
                  tab="block", q=None, price_error=None, price_params=None,
                  avail=None, block_url=None, month_str="", detail_block=None,
@@ -1235,11 +1266,13 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
     tab_block_href = f"/admin?tab=block{kp}"
     tab_price_href = f"/admin?tab=price{kp}"
     tab_bonus_href = f"/admin?tab=bonus{kp}"
+    tab_party_href = f"/admin?tab=party{kp}"
     tab_nav = (
         f'<nav class="tab-nav">'
         f'<a href="{tab_block_href}" class="{"active" if tab == "block" else ""}">Reservations</a>'
         f'<a href="{tab_price_href}" class="{"active" if tab == "price" else ""}">Pricing</a>'
         f'<a href="{tab_bonus_href}" class="{"active" if tab == "bonus" else ""}">Finances</a>'
+        f'<a href="{tab_party_href}" class="{"active" if tab == "party" else ""}">LAUNCH PARTY</a>'
         f'</nav>'
     )
 
@@ -1472,6 +1505,9 @@ def render_admin(props: dict, blocks: list, msg="", prefill=None, admin_key="",
             f'{bonus_nav}'
             f'<div class="result">{priced_html}{expenses_html}{unpriced_html}{excluded_html}{totals_html}</div>'
         )
+
+    elif tab == "party":
+        main_content = _render_launch_party()
 
     elif tab == "block" and prefill and (prefill.get("edit_id") or "").strip() \
             and edit_target is not None:
